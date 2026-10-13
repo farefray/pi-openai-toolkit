@@ -106,11 +106,12 @@ export async function callHistoryNotesBackend(
 		limit: TOOL_OUTPUT_TOKEN_LIMIT,
 	},
 	gatewayModels: readonly string[] = [],
+	resolveProvider: typeof resolveCodexContextProvider = resolveCodexContextProvider,
 ): Promise<HistoryNotesResult> {
 	const timeoutSignal = AbortSignal.timeout(BACKEND_TIMEOUT_MS);
 	if (signal?.aborted) return { ok: false, reason: "aborted" };
 	const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-	const providerResult = await resolveProviderWithDeadline(ctx, requestSignal, timeoutSignal, gatewayModels);
+	const providerResult = await resolveProviderWithDeadline(ctx, requestSignal, timeoutSignal, gatewayModels, resolveProvider);
 	if (providerResult === "aborted") return { ok: false, reason: "aborted" };
 	if (providerResult === "timeout") return { ok: false, reason: "backend-timeout" };
 	const provider = providerResult;
@@ -163,6 +164,7 @@ async function resolveProviderWithDeadline(
 	requestSignal: AbortSignal,
 	timeoutSignal: AbortSignal,
 	gatewayModels: readonly string[] = [],
+	resolveProvider: typeof resolveCodexContextProvider = resolveCodexContextProvider,
 ): Promise<Awaited<ReturnType<typeof resolveCodexContextProvider>> | "aborted" | "timeout"> {
 	if (requestSignal.aborted) return timeoutSignal.aborted ? "timeout" : "aborted";
 	return new Promise((resolve) => {
@@ -175,7 +177,7 @@ async function resolveProviderWithDeadline(
 		};
 		const onAbort = () => finish(timeoutSignal.aborted ? "timeout" : "aborted");
 		requestSignal.addEventListener("abort", onAbort, { once: true });
-		resolveCodexContextProvider(ctx, ctx.model, gatewayModels).then(
+		resolveProvider(ctx, ctx.model, gatewayModels).then(
 			(value) => finish(value),
 			() => finish({ ok: false, reason: "auth-resolution-failed" }),
 		);
@@ -186,6 +188,7 @@ export async function loadHistoryNotesThreadHint(
 	ctx: ExtensionContext,
 	signal?: AbortSignal,
 	gatewayModels: readonly string[] = [],
+	resolveProvider: typeof resolveCodexContextProvider = resolveCodexContextProvider,
 ): Promise<string | undefined> {
 	const result = await callHistoryNotesBackend(
 		THREAD_HINT_ENDPOINT,
@@ -194,6 +197,7 @@ export async function loadHistoryNotesThreadHint(
 		signal,
 		{ mode: "bytes", limit: THREAD_HINT_MAX_BYTES },
 		gatewayModels,
+		resolveProvider,
 	);
 	if (!result.ok) {
 		if (result.reason === "aborted") throw new Error("Remote context hint request was aborted");
@@ -211,6 +215,7 @@ export async function executeHistoryNotesTool(
 	ctx: ExtensionContext,
 	signal?: AbortSignal,
 	gatewayModels: readonly string[] = [],
+	resolveProvider: typeof resolveCodexContextProvider = resolveCodexContextProvider,
 ): Promise<AgentToolResult<CodexHistoryNotesDetails>> {
 	const endpoint = namespace === "history"
 		? HISTORY_ENDPOINTS[action as HistoryAction]
@@ -224,6 +229,7 @@ export async function executeHistoryNotesTool(
 		signal,
 		undefined,
 		gatewayModels,
+		resolveProvider,
 	);
 	if (!result.ok) throw new Error(formatHistoryNotesFailure(result.reason, result.status));
 	if (NOTES_WRITE_ENDPOINTS.has(endpoint) && isRejectedNotesWriteResponse(result.value)) {

@@ -366,18 +366,22 @@ export function removeNativeCompactionRetainedMessages(args: {
 export function serializeLiveTailToResponsesInput<TApi extends Api>(args: {
 	model: Model<TApi>;
 	entries: readonly SessionEntry[];
+	grammarToolInputProperties?: ReadonlyMap<string, string>;
 }): ResponsesInputItem[] {
 	return serializeMessagesToResponsesInput(args.model, collectReplayMessages(args.entries), {
 		firstSystemMessageIsUpdate: true,
+		grammarToolInputProperties: args.grammarToolInputProperties,
 	});
 }
 
 export async function serializeLiveTailToResponsesInputWithLimits<TApi extends Api>(args: {
 	model: Model<TApi>;
 	entries: readonly SessionEntry[];
+	grammarToolInputProperties?: ReadonlyMap<string, string>;
 }): Promise<ResponsesInputItem[]> {
 	return serializeMessagesToResponsesInputWithLimits(args.model, collectReplayMessages(args.entries), {
 		firstSystemMessageIsUpdate: true,
+		grammarToolInputProperties: args.grammarToolInputProperties,
 	});
 }
 

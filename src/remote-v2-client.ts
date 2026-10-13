@@ -206,7 +206,7 @@ export function parseSseEvents(raw: string): ParsedSseEvent[] | undefined {
 	}
 }
 
-function isRemoteV2CompactionItem(value: unknown): value is RemoteV2CompactionItem {
+export function isRemoteV2CompactionItem(value: unknown): value is RemoteV2CompactionItem {
 	return isRecord(value) && value.type === "compaction" && isNonEmptyString(value.encrypted_content);
 }
 

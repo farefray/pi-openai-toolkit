@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import type { Message, Model } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, getDeclaredTools, type Message, type Model, type Tool } from "@earendil-works/pi-ai";
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
+// SDK internals are a parity oracle only; production uses public getDeclaredTools.
+import { createGrammarToolInputProperties } from "@earendil-works/pi-ai/api/constrained-sampling";
+import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import {
+	GrammarToolSerializationError,
+	getGrammarToolInputProperties,
+	createResponsesInputParitySignature,
 	serializeLlmMessagesToResponsesInput,
 	serializeMessagesToResponsesInput,
 	serializeMessagesToResponsesInputWithLimits,
@@ -156,5 +163,176 @@ describe("Responses system message serialization", () => {
 			{ role: "system", content: "instructions" },
 			{ role: "system", content: "base" },
 		]);
+	});
+});
+
+const grammarModel: Model<"openai-responses"> = {
+	...model, compat: { supportsOpenAIGrammarTools: true },
+};
+function grammarTool(property = "source", variant = "openai_lark"): Tool {
+	return {
+		name: "script", description: "offline grammar fixture",
+		parameters: { type: "object", properties: { [property]: { type: "string" } }, required: [property] } as Tool["parameters"],
+		constrainedSampling: { type: "grammar", variants: { [variant]: variant === "openai_regex" ? ".*" : 'start: /.+/' } },
+	};
+}
+function declaration(tool: Tool): Message {
+	return { role: "system", content: "", toolsAdded: [tool], timestamp: 1 };
+}
+function grammarCall(args: Record<string, unknown> = { source: "return 1" }, id = "call_script|ctc_script"): Message {
+	return {
+		...fauxAssistantMessage(fauxToolCall("script", args, { id }), { stopReason: "toolUse", timestamp: 2 }),
+		provider: model.provider, api: model.api, model: model.id,
+	};
+}
+function grammarResult(): Message {
+	return { role: "toolResult", toolCallId: "call_script|ctc_script", toolName: "script",
+		content: [{ type: "text", text: "1\uD800" }], isError: false, timestamp: 3 };
+}
+function toolItems(input: readonly unknown[]): unknown[] {
+	return input.filter((item) => typeof item === "object" && item !== null &&
+		["function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"].includes((item as { type: string }).type));
+}
+function sdkToolItems(messages: Message[], activeModel = grammarModel): unknown[] {
+	const normalized = convertToLlm(messages);
+	return toolItems(convertResponsesMessages(activeModel, { messages: normalized }, new Set([model.provider]), {
+		grammarToolInputProperties: createGrammarToolInputProperties(getDeclaredTools(normalized), activeModel.compat?.supportsOpenAIGrammarTools === true),
+	}));
+}
+
+describe("Responses persisted grammar compatibility", () => {
+	for (const [variant, property] of [["openai_lark", "source"], ["openai_regex", "expression"], ["openai_lark", "code"]]) {
+		test(`${variant}/${property}: persisted removed declaration matches SDK without scratch customInput`, () => {
+			const messages: Message[] = JSON.parse(JSON.stringify([
+				declaration(grammarTool(property, variant)), grammarCall({ [property]: "return 1\uD800" }), grammarResult(),
+				{ role: "system", content: "", toolsRemoved: [{ name: "script" }], timestamp: 4 },
+			]));
+			const before = structuredClone(messages);
+			expect(getGrammarToolInputProperties(grammarModel, messages)).toEqual(new Map([["script", property]]));
+			const actual = toolItems(serializeMessagesToResponsesInput(grammarModel, messages));
+			expect(actual).toEqual([
+				{ type: "custom_tool_call", id: "ctc_script", call_id: "call_script", name: "script", input: "return 1" },
+				{ type: "custom_tool_call_output", call_id: "call_script", output: "1" },
+			]);
+			expect(actual).toEqual(sdkToolItems(messages));
+			expect(serializeLlmMessagesToResponsesInput(grammarModel, messages)).toEqual(serializeMessagesToResponsesInput(grammarModel, messages));
+			expect(JSON.stringify(messages)).not.toContain("customInput");
+			expect(messages).toEqual(before);
+		});
+	}
+
+	test("uses SDK last-declaration semantics, lark priority and permits optional properties", () => {
+		const first = grammarTool("old");
+		const last = grammarTool("expression", "openai_regex");
+		last.parameters.properties!.optional = { type: "number" };
+		last.constrainedSampling = { type: "grammar", variants: { openai_lark: "start: /.+/", openai_regex: ".*" } };
+		const messages = [declaration(first), declaration(last), grammarCall({ expression: "x" }), grammarResult()];
+		expect(getGrammarToolInputProperties(grammarModel, messages)).toEqual(new Map([["script", "expression"]]));
+		expect(toolItems(serializeMessagesToResponsesInput(grammarModel, messages))).toEqual(sdkToolItems(messages));
+	});
+
+	for (const compat of [undefined, { supportsOpenAIGrammarTools: false }]) {
+		test(`compat ${JSON.stringify(compat)} ignores grammar metadata and drops only custom IDs`, () => {
+			const fallbackModel = { ...model, compat };
+			const messages = [declaration(grammarTool()), grammarCall(), grammarResult(), assistant(), result(0), result(1)];
+			const input = toolItems(serializeMessagesToResponsesInput(fallbackModel, messages, {
+				grammarToolInputProperties: new Map([["script", "source"]]),
+			}));
+			expect(getGrammarToolInputProperties(fallbackModel, messages).size).toBe(0);
+			expect(input[0]).toEqual({ type: "function_call", id: undefined, call_id: "call_script", name: "script", arguments: '{"source":"return 1"}' });
+			expect(input[1]).toEqual({ type: "function_call_output", call_id: "call_script", output: "1" });
+			expect(input[2]).toMatchObject({ type: "function_call", id: "fc_a" });
+			expect(input.some((item) => (item as { type: string }).type.startsWith("custom_"))).toBe(false);
+		});
+	}
+
+	test("plain functions retain legacy IDs even with grammar compat enabled", () => {
+		const plain = grammarTool();
+		delete plain.constrainedSampling;
+		const input = toolItems(serializeMessagesToResponsesInput(grammarModel, [declaration(plain), grammarCall({}, "call_plain|legacy_id")]));
+		expect(input).toEqual([
+			{ type: "function_call", id: "legacy_id", call_id: "call_plain", name: "script", arguments: "{}" },
+			{ type: "function_call_output", call_id: "call_plain", output: "No result provided" },
+		]);
+	});
+
+	for (const id of ["call_script|fc_wrong", "call_script|foreign", "call_script"]) {
+		test(`custom ID guard ${id} preserves call_id`, () => {
+			const messages = [declaration(grammarTool()), grammarCall({ source: "x" }, id)];
+			const input = toolItems(serializeMessagesToResponsesInput(grammarModel, messages));
+			expect(input).toEqual([
+				{ type: "custom_tool_call", id: undefined, call_id: "call_script", name: "script", input: "x" },
+				{ type: "custom_tool_call_output", call_id: "call_script", output: "No result provided" },
+			]);
+		});
+	}
+
+	test("mixed custom/function real and synthetic outputs use one historical map", () => {
+		const messages = [declaration(grammarTool()), grammarCall(), grammarResult(), assistant(), result(0), grammarCall()];
+		const input = serializeMessagesToResponsesInput(grammarModel, messages);
+		expect(toolItems(input)).toEqual(sdkToolItems(messages));
+		expect(createResponsesInputParitySignature(input)).toEqual([
+			"custom_tool_call:script", "custom_tool_call_output", "function_call:read", "function_call:read",
+			"function_call_output", "function_call_output", "custom_tool_call:script", "custom_tool_call_output",
+		]);
+	});
+
+	const invalidDeclarations = [
+		{ parameters: { type: "string" } },
+		{ parameters: { type: "object", properties: { source: { type: "string" } } } },
+		{ parameters: { type: "object", properties: { source: { type: "string" } }, required: [] } },
+		{ parameters: { type: "object", properties: { source: { type: "string" } }, required: ["source", "other"] } },
+		{ parameters: { type: "object", properties: {}, required: ["secret-property"] } },
+		{ parameters: { type: "object", properties: { source: { type: "number" } }, required: ["source"] } },
+		{ parameters: { type: "object", properties: {}, required: [123] } },
+		{ constrainedSampling: { type: "grammar", variants: {} } },
+		{ constrainedSampling: { type: "grammar", variants: { openai_lark: " \n", openai_regex: "" } } },
+		{ constrainedSampling: { type: "grammar", variants: null } },
+	];
+	for (const [index, invalid] of invalidDeclarations.entries()) {
+		test(`invalid eligible declaration ${index} refuses with content-free error`, () => {
+			const messages = [declaration({ ...grammarTool(), ...invalid, name: "secret-tool" } as Tool)];
+			expect(() => serializeMessagesToResponsesInput(grammarModel, messages)).toThrow(GrammarToolSerializationError);
+			expect(() => serializeMessagesToResponsesInput(grammarModel, messages)).toThrow("Invalid OpenAI grammar tool declaration.");
+			expect(() => getGrammarToolInputProperties(grammarModel, messages)).toThrow("Invalid OpenAI grammar tool declaration.");
+			expect(() => serializeMessagesToResponsesInput(model, messages)).not.toThrow();
+		});
+	}
+	for (const args of [{}, { source: 12 }, { source: null }, { source: { secret: "payload" } }]) {
+		test(`invalid grammar input ${JSON.stringify(args)} refuses without leaking content`, () => {
+			const messages = [declaration(grammarTool()), grammarCall(args)];
+			expect(() => serializeMessagesToResponsesInput(grammarModel, messages)).toThrow(GrammarToolSerializationError);
+			expect(() => serializeMessagesToResponsesInput(grammarModel, messages)).toThrow("Invalid OpenAI grammar tool input.");
+		});
+	}
+
+	test("full-context metadata supports sliced tails, including empty string inputs", () => {
+		const full = [declaration(grammarTool("expression")), grammarCall({ expression: "" }), grammarResult()];
+		const properties = getGrammarToolInputProperties(grammarModel, full);
+		expect(toolItems(serializeMessagesToResponsesInput(grammarModel, full.slice(1), { grammarToolInputProperties: properties })))
+			.toEqual(sdkToolItems(full));
+		expect(properties).toEqual(new Map([["script", "expression"]]));
+	});
+
+	test("custom output images preserve text and enforce message/request limits", async () => {
+		const image = { type: "image" as const, data: "AQ==", mimeType: "image/png" };
+		const result = grammarResult();
+		if (result.role !== "toolResult") throw new Error("fixture");
+		result.content.push(image);
+		const messages = [declaration(grammarTool()), grammarCall(), result];
+		const before = structuredClone(messages);
+		const imageModel: Model<"openai-responses"> = {
+			...grammarModel, input: ["text", "image"], inputLimits: { images: { maxPerMessage: 1, maxPerRequest: 1 } },
+		};
+		const input = await serializeMessagesToResponsesInputWithLimits(imageModel, messages);
+		expect(input[1]).toEqual({ type: "custom_tool_call_output", call_id: "call_script", output: [
+			{ type: "input_text", text: "1" }, { type: "input_image", detail: "auto", image_url: "data:image/png;base64,AQ==" },
+		] });
+		expect(toolItems(input)).toEqual(sdkToolItems(messages, imageModel));
+		expect(messages).toEqual(before);
+		await expect(serializeMessagesToResponsesInputWithLimits(imageModel, [...messages, { role: "user", content: [image], timestamp: 4 }])).rejects.toThrow("per request");
+		result.content.push(image);
+		await expect(serializeMessagesToResponsesInputWithLimits(imageModel, messages)).rejects.toThrow("per message");
+		expect(toolItems(serializeMessagesToResponsesInput(grammarModel, messages))[1]).toEqual({ type: "custom_tool_call_output", call_id: "call_script", output: "1" });
 	});
 });

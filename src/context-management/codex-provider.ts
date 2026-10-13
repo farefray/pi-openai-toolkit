@@ -9,7 +9,9 @@ import {
 	filterCodexGatewayHeaders,
 } from "../responses-headers";
 export { CODEX_AFFINITY_SCOPE } from "../responses-headers";
-import { normalizeBaseUrl, resolveEffectiveModel, VIRTUAL_MODEL_API } from "../runtime";
+import { normalizeBaseUrl, VIRTUAL_MODEL_API, type ToolkitRuntime } from "../runtime-core";
+const legacyEffectiveModel: ToolkitRuntime["resolveEffectiveModel"] = async (ctx, model) =>
+	(await import("../runtime")).resolveEffectiveModel(ctx, model);
 import { isExactModelAllowed } from "../model-scope";
 import {
 	isNonEmptyString,
@@ -171,6 +173,7 @@ export async function resolveCodexContextProvider(
 	ctx: ExtensionContext,
 	modelOverride: ExtensionContext["model"] = ctx.model,
 	gatewayModels: readonly string[] = [],
+	resolveEffectiveModel: ToolkitRuntime["resolveEffectiveModel"] = legacyEffectiveModel,
 ): Promise<CodexContextProviderResolution> {
 	const selectedModel = modelOverride;
 	const selectedDescriptor = {

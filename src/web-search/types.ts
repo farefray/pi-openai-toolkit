@@ -1,4 +1,4 @@
-import { VIRTUAL_MODEL_API } from "../runtime";
+import { VIRTUAL_MODEL_API } from "../runtime-core";
 import { getExactModelKey, isExactModelAllowed } from "../model-scope";
 import type { WebSearchConfig, WebSearchRoute } from "../types";
 

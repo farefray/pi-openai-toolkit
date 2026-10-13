@@ -1,0 +1,8 @@
+{
+  "name": "thegame-pi-openai-toolkit",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": ["../src/thegame-extension.ts"]
+  }
+}

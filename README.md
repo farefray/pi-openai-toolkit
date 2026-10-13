@@ -1,5 +1,7 @@
 # pi-openai-toolkit
 
+> **Thegame fork:** for the shared Pi/pi-web host, select the local `thegame/` subpackage, not the full upstream extension set. See [safe integration and limitations](docs/thegame-integration.md) and [fork patches](PATCHES.md). Initial project policy keeps native Pi compaction and existing search/imagegen; subscription capability support is route-specific.
+
 Remote context windows, Responses compaction, web search, and image generation for Pi. Uses Pi's existing models, endpoints, authentication, and sessions without registering another provider or model.
 
 [![npm version](https://img.shields.io/npm/v/pi-openai-toolkit.svg)](https://www.npmjs.com/package/pi-openai-toolkit)

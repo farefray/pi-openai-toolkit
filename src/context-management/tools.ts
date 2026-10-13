@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
+import { resolveCodexContextProvider } from "./codex-provider";
 import { executeHistoryNotesTool, type CodexHistoryNotesDetails } from "./history-notes";
 import { type CodexContextWindowManager } from "./window-manager";
 import {
@@ -108,6 +109,7 @@ export function createContextManagementTools(
 	isActive: ContextActivity,
 	getGatewayModels: () => readonly string[] = () => [],
 	handoff?: ContextRolloverHandoff,
+	resolveProvider: typeof resolveCodexContextProvider = resolveCodexContextProvider,
 ): ContextManagementTools {
 	const assertActive = async (ctx: ExtensionContext): Promise<readonly string[]> => {
 		const policy = await isActive(ctx);
@@ -196,7 +198,7 @@ export function createContextManagementTools(
 		],
 		execute: async (_id, params, _signal, _update, ctx) => {
 			const gatewayModels = await assertActive(ctx);
-			return executeHistoryNotesTool("history", params.action, params as Record<string, unknown>, ctx, _signal, gatewayModels);
+			return executeHistoryNotesTool("history", params.action, params as Record<string, unknown>, ctx, _signal, gatewayModels, resolveProvider);
 		},
 	};
 	const notes: ToolDefinition<typeof NOTES_PARAMETERS, CodexHistoryNotesDetails> = {
@@ -217,7 +219,7 @@ export function createContextManagementTools(
 		executionMode: "sequential",
 		execute: async (_id, params, _signal, _update, ctx) => {
 			const gatewayModels = await assertActive(ctx);
-			return executeHistoryNotesTool("notes", params.action, params as Record<string, unknown>, ctx, _signal, gatewayModels);
+			return executeHistoryNotesTool("notes", params.action, params as Record<string, unknown>, ctx, _signal, gatewayModels, resolveProvider);
 		},
 	};
 	return { newContext, getContextRemaining, history, notes };
@@ -355,9 +357,10 @@ export function registerContextManagementTools(
 	isActive: ContextActivity,
 	getGatewayModels?: () => readonly string[],
 	handoff?: ContextRolloverHandoff,
+	resolveProvider: typeof resolveCodexContextProvider = resolveCodexContextProvider,
 ): ContextManagementToolController {
 	const controller = new ContextManagementToolController(pi);
-	controller.register(createContextManagementTools(pi, manager, isActive, getGatewayModels, handoff));
+	controller.register(createContextManagementTools(pi, manager, isActive, getGatewayModels, handoff, resolveProvider));
 	return controller;
 }
 

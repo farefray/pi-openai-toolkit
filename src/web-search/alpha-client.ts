@@ -1,6 +1,6 @@
 import { StringEnum, Type, type Static } from "@earendil-works/pi-ai";
 import { buildResponsesRequestHeaders } from "../responses-headers";
-import { buildAlphaSearchUrl, type ResponsesRuntime } from "../runtime";
+import { buildAlphaSearchUrl, type ResponsesRuntime } from "../runtime-core";
 import { WEB_RUN_TOOL_NAME } from "./types";
 
 export const MAX_ALPHA_ACTIONS = 8;

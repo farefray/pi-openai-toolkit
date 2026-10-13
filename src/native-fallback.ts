@@ -6,10 +6,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { ProviderHeaders } from "@earendil-works/pi-ai";
 import { mergeProviderHeaders } from "./provider-headers";
-import { parseModelSpec } from "./runtime";
+import { parseModelSpec } from "./runtime-core";
 import type { CompactionConfig } from "./types";
 
-export { parseModelSpec } from "./runtime";
+export { parseModelSpec } from "./runtime-core";
 
 export type NativeFallbackFailureReason =
 	| "disabled"

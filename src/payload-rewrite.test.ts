@@ -3,7 +3,8 @@ import { describe, expect, test } from "bun:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { resolveLatestNativeCompactionEntry } from "./details-store";
-import { removeNativeCompactionRetainedMessages, serializeLiveTailToResponsesInput, rewriteResponsesPayloadWithNativeReplay } from "./payload-rewrite";
+import { removeNativeCompactionRetainedMessages, serializeLiveTailToResponsesInput, serializeLiveTailToResponsesInputWithLimits, rewriteResponsesPayloadWithNativeReplay } from "./payload-rewrite";
+import { getGrammarToolInputProperties } from "./serializer";
 import {
 	createNativeCompactionDetails,
 	NATIVE_COMPACTION_FALLBACK_SUMMARY,
@@ -409,4 +410,49 @@ test("editing only post-checkpoint input keeps replay valid and navigation resto
 	result = remove();
 	assert(result.ok);
 	expect(JSON.stringify(result.messages)).toContain("newly-edited-tail");
+});
+
+test("canonical checkpoint declarations feed sliced grammar tails; rewrite preserves SDK custom pair and tools once", async () => {
+	const args = fixture();
+	const tool = {
+		name: "script", description: "offline",
+		parameters: { type: "object", properties: { expression: { type: "string" } }, required: ["expression"] },
+		constrainedSampling: { type: "grammar", variants: { openai_regex: ".*" } },
+	};
+	args.manager.appendMessage({ role: "system", content: "", toolsAdded: [tool], timestamp: 5 } as never);
+	args.manager.appendCompaction(NATIVE_COMPACTION_FALLBACK_SUMMARY, null, 200, args.compactionEntry.details);
+	args.manager.appendMessage({
+		...fauxAssistantMessage(fauxToolCall("script", { expression: "x + 1" }, { id: "call_script|ctc_script" }), { stopReason: "toolUse", timestamp: 6 }),
+		provider: liveTailModel.provider, api: liveTailModel.api, model: liveTailModel.id,
+	});
+	args.manager.appendMessage({ role: "toolResult", toolCallId: "call_script|ctc_script", toolName: "script",
+		content: [{ type: "text", text: "2" }], isError: false, timestamp: 7 });
+	const branchEntries = args.manager.getBranch();
+	const before = structuredClone(branchEntries);
+	const latest = resolveLatestNativeCompactionEntry(branchEntries, { baseUrl: liveTailModel.baseUrl });
+	assert(latest.ok);
+	const model: Model<"openai-responses"> = { ...liveTailModel, compat: { supportsOpenAIGrammarTools: true } };
+	// Only canonical projection metadata; never restore raw sealed messages.
+	const fullProjection = args.manager.buildSessionProjection().messages;
+	const properties = getGrammarToolInputProperties(model, fullProjection);
+	expect(properties).toEqual(new Map([["script", "expression"]]));
+	const boundary = branchEntries.findIndex(entry => entry.id === latest.entry.id);
+	const tailEntries = branchEntries.slice(boundary + 1);
+	const pair = [
+		{ type: "custom_tool_call", id: "ctc_script", call_id: "call_script", name: "script", input: "x + 1" },
+		{ type: "custom_tool_call_output", call_id: "call_script", output: "2" },
+	];
+	expect(serializeLiveTailToResponsesInput({ model, entries: tailEntries, grammarToolInputProperties: properties })).toEqual(pair);
+	expect(await serializeLiveTailToResponsesInputWithLimits({ model, entries: tailEntries, grammarToolInputProperties: properties })).toEqual(pair);
+	const tools = [{ type: "custom", name: "script", format: { type: "grammar", syntax: "regex", definition: ".*" } }];
+	const payload = { input: [{ role: "user", content: `<summary>${latest.entry.summary}</summary>` }, ...pair], tools };
+	const payloadBefore = structuredClone(payload);
+	const rewritten = rewriteResponsesPayloadWithNativeReplay({ model, branchEntries, compactionEntry: latest.entry,
+		expectedInputProvenance: NATIVE_COMPACTION_INPUT_PROVENANCE, payload });
+	assert(rewritten.ok);
+	expect(rewritten.rewrittenPayload.input).toEqual([{ type: "compaction", encrypted_content: "opaque" }, ...pair]);
+	expect(rewritten.segments.post).toEqual(pair);
+	expect(rewritten.rewrittenPayload.tools).toEqual(tools);
+	expect(payload).toEqual(payloadBefore);
+	expect(args.manager.getBranch()).toEqual(before);
 });

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { buildSessionContext, estimateTokens, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { resolveToolkitConfig, type ResolvedToolkitConfig } from "../config";
-import { parseModelSpec } from "../runtime";
+import { parseModelSpec } from "../runtime-core";
 import { THINKING_LEVELS } from "../types";
 import { resolveCodexContextProvider } from "./codex-provider";
 import { findLatestNotesCheckpointSinceBoundary, findLatestWindowBoundaryEntry, type CodexContextWindowManager } from "./window-manager";
@@ -96,7 +96,7 @@ export class ManagedManualCompact implements ContextRolloverHandoff {
 	private checkpointStopped = false;
 	private maintenance = 0;
 
-	constructor(private readonly pi: ExtensionAPI, private readonly windows: CodexContextWindowManager, private readonly deliveryTimeoutMs = 10_000) {}
+	constructor(private readonly pi: ExtensionAPI, private readonly windows: CodexContextWindowManager, private readonly deliveryTimeoutMs = 10_000, private readonly resolveProvider: typeof resolveCodexContextProvider = resolveCodexContextProvider) {}
 
 	get busy(): boolean { return !!this.record && !TERMINAL.has(this.record.phase); }
 	get snapshot() { return this.busy ? this.sourcePolicy?.snapshot : undefined; }
@@ -180,8 +180,8 @@ export class ManagedManualCompact implements ContextRolloverHandoff {
 		const generation = ++this.generation;
 		try {
 			const [originalProvider, targetProvider] = await preflightDeadline(Promise.all([
-				resolveCodexContextProvider(ctx, ctx.model, source.gatewayModelKeys),
-				resolveCodexContextProvider(ctx, target, targetPolicy.gatewayModelKeys),
+				this.resolveProvider(ctx, ctx.model, source.gatewayModelKeys),
+				this.resolveProvider(ctx, target, targetPolicy.gatewayModelKeys),
 			]), event.signal);
 			if (!this.current(ctx, generation)) return;
 			if (event.signal.aborted) throw new Error("cancelled before switching models");

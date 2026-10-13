@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { compact, convertToLlm } from "@earendil-works/pi-coding-agent";
+import { getDeclaredTools } from "@earendil-works/pi-ai";
 import type {
 	Api,
 	AssistantMessage,
@@ -87,6 +88,20 @@ export type ResponsesFunctionCallOutputItem = {
 	output: ResponsesInputContentItem[] | string;
 };
 
+export type ResponsesCustomToolCallItem = {
+	type: "custom_tool_call";
+	id?: string;
+	call_id: string;
+	name: string;
+	input: string;
+};
+
+export type ResponsesCustomToolCallOutputItem = {
+	type: "custom_tool_call_output";
+	call_id: string;
+	output: ResponsesInputContentItem[] | string;
+};
+
 export type ResponsesReasoningItem = Record<string, unknown>;
 
 /**
@@ -109,6 +124,8 @@ export type ResponsesInputItem =
 	| ResponsesAssistantOutputItem
 	| ResponsesFunctionCallItem
 	| ResponsesFunctionCallOutputItem
+	| ResponsesCustomToolCallItem
+	| ResponsesCustomToolCallOutputItem
 	| ResponsesReasoningItem;
 
 /** The synthetic request shares the live-request extras allowlist. */
@@ -123,6 +140,8 @@ export type SerializeResponsesMessagesOptions = {
 	includeInstructionsInInput?: boolean;
 	/** Treat a system message at the start of a sliced post-compaction tail as an update. */
 	firstSystemMessageIsUpdate?: boolean;
+	/** Derived from the full projected transcript when serializing a sliced tail. */
+	grammarToolInputProperties?: ReadonlyMap<string, string>;
 };
 
 export type ResponsesParityReport = {
@@ -148,6 +167,60 @@ function instructionRole<TApi extends Api>(model: Model<TApi>): "developer" | "s
 	// shape, while the runtime field is shared by both supported Pi versions.
 	const compat = model.compat as { supportsDeveloperRole?: boolean } | undefined;
 	return model.reasoning && compat?.supportsDeveloperRole !== false ? "developer" : "system";
+}
+
+/** A grammar refusal must cancel compaction, not fall through a swallowed hook error. */
+export class GrammarToolSerializationError extends Error {
+	constructor(kind: "declaration" | "input") {
+		super(`Invalid OpenAI grammar tool ${kind}.`);
+		this.name = "GrammarToolSerializationError";
+	}
+}
+
+/** Resolve historical declarations, including tools removed from the current loadout. */
+export function getGrammarToolInputProperties<TApi extends Api>(
+	model: Model<TApi>,
+	messages: AgentMessage[],
+): ReadonlyMap<string, string> {
+	return getLlmGrammarToolInputProperties(model, convertToLlm(messages));
+}
+
+function getLlmGrammarToolInputProperties<TApi extends Api>(
+	model: Model<TApi>,
+	messages: Message[],
+): ReadonlyMap<string, string> {
+	const properties = new Map<string, string>();
+	if (!supportsGrammarTools(model)) return properties;
+
+	for (const tool of getDeclaredTools(messages)) {
+		const config = tool.constrainedSampling;
+		if (!config || config.type !== "grammar") continue;
+		const variants = config.variants;
+		const hasVariant = [variants?.openai_lark, variants?.openai_regex].some(
+			(value) => typeof value === "string" && value.trim().length > 0,
+		);
+		const schema = tool.parameters as {
+			type?: unknown;
+			required?: unknown;
+			properties?: Record<string, { type?: unknown }>;
+		};
+		// Mirror SDK inferGrammarInputProperty: exactly one required string property;
+		// optional properties do not prevent use of the grammar input property.
+		const required = schema?.required;
+		const property = Array.isArray(required) && required.length === 1 ? required[0] : undefined;
+		if (
+			!hasVariant || schema?.type !== "object" || typeof property !== "string" ||
+			schema.properties?.[property]?.type !== "string"
+		) {
+			throw new GrammarToolSerializationError("declaration");
+		}
+		properties.set(tool.name, property);
+	}
+	return properties;
+}
+
+function supportsGrammarTools<TApi extends Api>(model: Model<TApi>): boolean {
+	return (model.compat as { supportsOpenAIGrammarTools?: boolean } | undefined)?.supportsOpenAIGrammarTools === true;
 }
 
 export function collectCompactionWindowMessages(preparation: CompactionPreparation): AgentMessage[] {
@@ -236,6 +309,9 @@ export function serializeLlmMessagesToResponsesInput<TApi extends Api>(
 	messages: Message[],
 	options: SerializeResponsesMessagesOptions = {},
 ): ResponsesInputItem[] {
+	const grammarToolInputProperties = supportsGrammarTools(model)
+		? options.grammarToolInputProperties ?? getLlmGrammarToolInputProperties(model, messages)
+		: new Map<string, string>();
 	const transformedMessages = transformMessagesForResponses(messages);
 	const input: ResponsesInputItem[] = [];
 
@@ -265,7 +341,7 @@ export function serializeLlmMessagesToResponsesInput<TApi extends Api>(
 		}
 
 		if (message.role === "assistant") {
-			const items = serializeAssistantMessage(message, messageIndex);
+			const items = serializeAssistantMessage(message, messageIndex, grammarToolInputProperties);
 			if (items.length > 0) {
 				input.push(...items);
 			}
@@ -274,7 +350,7 @@ export function serializeLlmMessagesToResponsesInput<TApi extends Api>(
 		}
 
 		if (message.role === "toolResult") {
-			input.push(serializeToolResultMessage(message, model));
+			input.push(serializeToolResultMessage(message, model, grammarToolInputProperties));
 			messageIndex++;
 			continue;
 		}
@@ -377,7 +453,7 @@ async function loadResizeImage(): Promise<ResizeImageFunction | undefined> {
 function inputContentArray(item: ResponsesInputItem): ResponsesInputContentItem[] | undefined {
 	if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
 	const candidate = item as Record<string, unknown>;
-	if (candidate.type === "function_call_output") {
+	if (candidate.type === "function_call_output" || candidate.type === "custom_tool_call_output") {
 		return Array.isArray(candidate.output) ? candidate.output as ResponsesInputContentItem[] : undefined;
 	}
 	return Array.isArray(candidate.content) ? candidate.content as ResponsesInputContentItem[] : undefined;
@@ -457,7 +533,7 @@ export async function applyModelImageInputLimits<TApi extends Api>(
 				: contentItem);
 		}
 		const itemRecord = item as Record<string, unknown>;
-		if (itemRecord.type === "function_call_output") {
+		if (itemRecord.type === "function_call_output" || itemRecord.type === "custom_tool_call_output") {
 			output.push({ ...item, output: resizedContent } as ResponsesInputItem);
 		} else {
 			output.push({ ...item, content: resizedContent } as ResponsesInputItem);
@@ -633,7 +709,11 @@ function serializeUserContentItem<TApi extends Api>(
 	];
 }
 
-function serializeAssistantMessage(message: AssistantMessage, messageIndex: number): ResponsesInputItem[] {
+function serializeAssistantMessage(
+	message: AssistantMessage,
+	messageIndex: number,
+	grammarToolInputProperties: ReadonlyMap<string, string>,
+): ResponsesInputItem[] {
 	const items: ResponsesInputItem[] = [];
 
 	for (const block of message.content) {
@@ -659,9 +739,24 @@ function serializeAssistantMessage(message: AssistantMessage, messageIndex: numb
 		}
 
 		const [callId, rawItemId] = block.id.split("|");
+		const inputProperty = grammarToolInputProperties.get(block.name);
+		if (inputProperty !== undefined) {
+			const rawInput = block.arguments?.[inputProperty];
+			if (typeof rawInput !== "string") {
+				throw new GrammarToolSerializationError("input");
+			}
+			items.push({
+				type: "custom_tool_call",
+				id: rawItemId?.startsWith("ctc_") ? rawItemId : undefined,
+				call_id: callId,
+				name: block.name,
+				input: sanitizeSurrogates(rawInput),
+			});
+			continue;
+		}
 		items.push({
 			type: "function_call",
-			id: rawItemId,
+			id: rawItemId?.startsWith("ctc_") ? undefined : rawItemId,
 			call_id: callId,
 			name: block.name,
 			arguments: JSON.stringify(block.arguments),
@@ -674,7 +769,9 @@ function serializeAssistantMessage(message: AssistantMessage, messageIndex: numb
 function serializeToolResultMessage<TApi extends Api>(
 	message: ToolResultMessage,
 	model: Model<TApi>,
-): ResponsesFunctionCallOutputItem {
+	grammarToolInputProperties: ReadonlyMap<string, string>,
+): ResponsesFunctionCallOutputItem | ResponsesCustomToolCallOutputItem {
+	const type = grammarToolInputProperties.has(message.toolName) ? "custom_tool_call_output" : "function_call_output";
 	const [callId] = message.toolCallId.split("|");
 	const textOutput = message.content
 		.filter((item): item is TextContent => item.type === "text")
@@ -699,14 +796,14 @@ function serializeToolResultMessage<TApi extends Api>(
 			});
 		}
 		return {
-			type: "function_call_output",
+			type,
 			call_id: callId,
 			output,
 		};
 	}
 
 	return {
-		type: "function_call_output",
+		type,
 		call_id: callId,
 		output: hasText ? textOutput : "(see attached image)",
 	};
@@ -861,12 +958,12 @@ function describeResponsesInputItem(item: unknown): string {
 		return `message:${typeof record.role === "string" ? record.role : "unknown"}${phase}`;
 	}
 
-	if (type === "function_call") {
-		return `function_call:${typeof record.name === "string" ? record.name : "unknown"}`;
+	if (type === "function_call" || type === "custom_tool_call") {
+		return `${type}:${typeof record.name === "string" ? record.name : "unknown"}`;
 	}
 
-	if (type === "function_call_output") {
-		return "function_call_output";
+	if (type === "function_call_output" || type === "custom_tool_call_output") {
+		return type;
 	}
 
 	if (type === "reasoning") {

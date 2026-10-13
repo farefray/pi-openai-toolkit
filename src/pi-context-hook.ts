@@ -10,8 +10,6 @@ type ProjectionState = {
 	failure?: string;
 };
 
-const activeProjectionByRunner = new WeakMap<ExtensionRunner, ProjectionState>();
-
 type PatchedExtensionContext = ExtensionContext & {
 	[PI_CONTEXT_PROJECTOR_FIELD]?: PiContextHookProjector;
 	[PI_CONTEXT_PROJECTION_REPORTER_FIELD]?: (reason: string) => void;
@@ -28,7 +26,7 @@ export type PiContextHookProjector = (
 
 export type PiContextHookPatchResult =
 	| { ok: true; installed: boolean; reason?: "already-installed" }
-	| { ok: false; reason: "emit-context-unavailable" | "create-context-unavailable" };
+	| { ok: false; reason: "emit-context-unavailable" | "create-context-unavailable" | "disabled-by-policy" };
 
 /**
  * Add a narrow projection method to every ExtensionContext created by Pi.
@@ -55,6 +53,7 @@ export function installPiContextHookPatch(): PiContextHookPatchResult {
 		return { ok: true, installed: false, reason: "already-installed" };
 	}
 
+	const activeProjectionByRunner = new WeakMap<ExtensionRunner, ProjectionState>();
 	const patched = function patchedCreateContext(this: ExtensionRunner): ExtensionContext {
 		const context = original.call(this) as PatchedExtensionContext;
 		if (!(PI_CONTEXT_PROJECTOR_FIELD in context)) {

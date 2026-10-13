@@ -8,8 +8,7 @@ import type {
 	SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import { assertConfigValid, loadToolkitConfig, resolveToolkitConfig, type ResolvedToolkitConfig } from "./config";
-import { notifyConfigIssues } from "./config/notifications";
-import { registerToolkitConfigCommand } from "./config-command";
+import { createConfigNotifier, createToolkitConfigCommandRegistrar, type ToolkitConfigReader, type ConfigNotifier } from "./config/notifications-core";
 import {
 	codexContextProviderHeaders,
 	resolveCodexContextProvider,
@@ -37,7 +36,7 @@ import {
 import { CODEX_GATEWAY_FORWARD_HEADERS } from "./responses-headers";
 import { executeNativeCompaction, type NativeCompactionClientResult } from "./compact-client";
 import { qualifiesForStandaloneCompaction, type CompactionErrorInfo } from "./compaction-errors";
-import { resolveLatestNativeCompactionEntry } from "./details-store";
+import { findLatestCompactionEntry, resolveLatestNativeCompactionEntry } from "./details-store";
 import {
 	getPiContextHookProjector,
 	installPiContextHookPatch,
@@ -51,21 +50,21 @@ import {
 	removeNativeCompactionRetainedMessages,
 	serializeLiveTailToResponsesInputWithLimits,
 } from "./payload-rewrite";
-import { getCompactionRequestExtras, rememberRequestContext } from "./request-context-cache";
+import { createRequestContextCache, type RequestContextCache } from "./request-context-cache-core";
 import { resolveWebSearchRoute } from "./web-search/types";
-import { executeRemoteV2Compaction } from "./remote-v2-client";
+import { executeRemoteV2Compaction, isRemoteV2CompactionItem } from "./remote-v2-client";
 import {
-	rememberPhysicalModel,
-	resolveEffectiveModel,
-	resolveNativeCompactionEnvironment,
-	resolveRemoteCompactionExecution,
+	createToolkitRuntime,
+	type ToolkitRuntime,
 	isStandaloneCompactionEligible,
 	parseModelSpec,
 	type RemoteCompactionExecution,
-} from "./runtime";
+} from "./runtime-core";
 import {
 	serializeMessagesToCompactRequestWithLimits,
 	serializeMessagesToResponsesInputWithLimits,
+	getGrammarToolInputProperties,
+	GrammarToolSerializationError,
 	type NativeCompactionRequestBody,
 	type ResponsesInputItem,
 } from "./serializer";
@@ -75,6 +74,8 @@ import {
 	COMPACTION_EXTENSION_ID,
 	LEGACY_NATIVE_COMPACTION_STRATEGY,
 	REMOTE_V2_COMPACTION_STRATEGY,
+	NATIVE_COMPACTION_FALLBACK_SUMMARY,
+	STANDALONE_COMPACTION_FALLBACK_SUMMARY,
 	getLatestDeferredToolCarryover,
 	getRemoteV2InputProvenance,
 	isNativeCompactionDetails,
@@ -88,8 +89,31 @@ type CompactionContextProjection = (
 	ctx: ExtensionContext,
 ) => readonly AgentMessage[] | undefined | Promise<readonly AgentMessage[] | undefined>;
 
-function contextOperation(loadConfig: typeof loadToolkitConfig, ctx: ExtensionContext, model = ctx.model): ResolvedToolkitConfig {
-	const loaded = loadConfig();
+export type CompactionActivation = {
+	runtime?: ToolkitRuntime;
+	requestCache?: RequestContextCache;
+	notifyConfigIssues?: ConfigNotifier;
+	registerConfigCommand?: ReturnType<typeof createToolkitConfigCommandRegistrar>;
+	installContextHookPatch?: typeof installPiContextHookPatch;
+	projectPolicy?: boolean;
+	/** Publish the snapshot-aware reader; an activation may return its guarded shared reader. */
+	onOperationReader?: (reader: ToolkitConfigReader) => ToolkitConfigReader | void;
+};
+
+/** All request/session state is provided by the activation, never an imported singleton. */
+export function createCompactionExtension(activation: CompactionActivation = {}) {
+	const runtime = activation.runtime ?? createToolkitRuntime();
+	const { rememberPhysicalModel, resolveEffectiveModel, resolveNativeCompactionEnvironment, resolveRemoteCompactionExecution } = runtime;
+	const requestCache = activation.requestCache ?? createRequestContextCache();
+	const { getCompactionRequestExtras, rememberRequestContext } = requestCache;
+	const notifier = createConfigNotifier();
+	const notifyConfigIssues = activation.notifyConfigIssues ?? notifier.notifyConfigIssues;
+	const registerToolkitConfigCommand = activation.registerConfigCommand ?? createToolkitConfigCommandRegistrar();
+	const resolveProvider: typeof resolveCodexContextProvider = (ctx, model, gatewayModels) =>
+		resolveCodexContextProvider(ctx, model, gatewayModels, resolveEffectiveModel);
+
+function contextOperation(loadConfig: ToolkitConfigReader, ctx: ExtensionContext, model = ctx.model): ResolvedToolkitConfig {
+	const loaded = loadConfig(ctx);
 	const resolved = resolveToolkitConfig(loaded, model);
 	notifyConfigIssues(ctx, resolved);
 	return resolved;
@@ -110,7 +134,8 @@ function compactGatewayModels(resolved: ResolvedToolkitConfig): readonly string[
 }
 
 type CompactionDependencies = {
-	loadConfig: typeof loadToolkitConfig;
+	loadConfig: ToolkitConfigReader;
+	activation?: CompactionActivation;
 	remoteCompact: typeof executeRemoteV2Compaction;
 	standaloneCompact: typeof executeNativeCompaction;
 	nativeFallback: typeof runNativeFallbackCompaction;
@@ -200,7 +225,7 @@ async function isRemoteContextActive(
 	model: ExtensionContext["model"] = ctx.model,
 ): Promise<boolean> {
 	if (!config.enabled || config.contextManagement !== "remote") return false;
-	const resolution = await resolveCodexContextProvider(ctx, model, config.gatewayContextModels);
+	const resolution = await resolveProvider(ctx, model, config.gatewayContextModels);
 	return resolution.ok;
 }
 
@@ -399,7 +424,8 @@ async function runResponsesNativeCompact(
 				...(await serializeMessagesToResponsesInputWithLimits(
 					compactor.currentModel,
 					[...projection.messages.slice(summaryIndex + 1)],
-					{ firstSystemMessageIsUpdate: true },
+					{ firstSystemMessageIsUpdate: true,
+						grammarToolInputProperties: getGrammarToolInputProperties(compactor.currentModel, [...projection.messages]) },
 				)),
 			];
 			request = {
@@ -411,7 +437,8 @@ async function runResponsesNativeCompact(
 			const liveTailEntries = branchEntries.slice(latestNativeCompaction.index + 1);
 			const input: ResponsesInputItem[] = [
 				...(cloneOpaqueWindow(details.compactedWindow) as ResponsesInputItem[]),
-				...(await serializeLiveTailToResponsesInputWithLimits({ model: compactor.currentModel, entries: liveTailEntries })),
+				...(await serializeLiveTailToResponsesInputWithLimits({ model: compactor.currentModel, entries: liveTailEntries,
+					grammarToolInputProperties: getGrammarToolInputProperties(compactor.currentModel, readSessionContextMessages(ctx) ?? []) })),
 			];
 			request = {
 				model: compactor.requestModel ?? compactor.model,
@@ -523,6 +550,7 @@ async function runResponsesNativeCompact(
 				errorType: compactResult.errorType,
 				errorParam: compactResult.errorParam,
 				errorMessage: compactResult.errorMessage,
+				errorCategory: compactResult.errorCategory,
 			};
 			if (protocol === "standalone-compact") writeDebugArtifact("compaction-event", {
 				event: "session_before_compact.standalone-compact-failure", protocol, ...remoteFailure, nextStep: "native-summary",
@@ -744,6 +772,37 @@ async function runUnavailableContextCompaction(
 	return { cancel: true };
 }
 
+// Project safety is independent of producer enablement: an opaque marker is not a text summary.
+// Legacy entrypoints and Remote Windows retain their existing routing contract.
+function requireProjectCheckpointReplay(ctx: ExtensionContext, resolved: ResolvedToolkitConfig) {
+	const config = resolved.config.compaction;
+	if (!activation.projectPolicy || config.contextManagement === "remote") return undefined;
+	const branch = ctx.sessionManager.getBranch();
+	const latest = findLatestCompactionEntry(branch);
+	if (!latest || (!isNativeCompactionDetails(latest.details)
+		&& latest.summary !== NATIVE_COMPACTION_FALLBACK_SUMMARY
+		&& latest.summary !== STANDALONE_COMPACTION_FALLBACK_SUMMARY)) return undefined;
+	const refuse = (reason: string): never => {
+		reportPiContextHookFailure(ctx, reason);
+		ctx.abort();
+		throw new Error(`Opaque checkpoint replay refused (${reason}); history was left unchanged.`);
+	};
+	if (!config.enabled) refuse("checkpoint-reader-disabled");
+	const native = resolveLatestNativeCompactionEntry(branch);
+	if (!native.ok) return refuse("malformed-opaque-checkpoint");
+	const details = native.entry.details;
+	if (!details) return refuse("malformed-opaque-checkpoint");
+	if (details.strategy === REMOTE_V2_COMPACTION_STRATEGY) {
+		const window = details.compactedWindow;
+		const checkpoints = window.filter((item) => (item as Record<string, unknown>).type === "compaction");
+		if (checkpoints.length !== 1 || !isRemoteV2CompactionItem(checkpoints[0])) refuse("malformed-opaque-checkpoint");
+	}
+	if (!hasVerifiedCompactionInputProvenance(native.entry.details, getRemoteV2InputProvenance(config.remoteV2ContextSource)))
+		refuse(COMPACTION_CHECKPOINT_PROVENANCE_UNAVAILABLE);
+	if (hasInvalidatedCompactionContext(branch, native.entry.id)) refuse(COMPACTION_CHECKPOINT_CONTEXT_EDITED);
+	return native.entry;
+}
+
 async function handleSessionBeforeCompact(
 	event: SessionBeforeCompactEvent,
 	ctx: ExtensionContext,
@@ -754,8 +813,16 @@ async function handleSessionBeforeCompact(
 	const resolved = contextOperation(dependencies.loadConfig, ctx);
 	if (resolved.invalidFeatures.some((feature) => ["context", "compatibility", "diagnostics"].includes(feature))) return { cancel: true };
 	const config = resolved.config.compaction;
+	let projectCheckpoint;
+	try { projectCheckpoint = requireProjectCheckpointReplay(ctx, resolved); }
+	catch { return { cancel: true }; }
 	if (!config.enabled) {
 		return undefined;
+	}
+	if (activation.projectPolicy && config.contextManagement !== "remote" && config.remoteV2ContextSource === "pi-context-hook"
+		&& !dependencies.projectCompactionContext && !getPiContextHookProjector(ctx)) {
+		notifyWarning(ctx, "Remote V2 compaction cancelled: ordered context-hook projection is unavailable; history was left unchanged.");
+		return { cancel: true };
 	}
 
 	writeDebugArtifact(
@@ -901,6 +968,21 @@ async function handleSessionBeforeCompact(
 		}
 		// Only an actual exhausted remote attempt warns, never an input/routing skip.
 		if (event.signal?.aborted) return { cancel: true };
+		if (projectCheckpoint || (activation.projectPolicy && !config.nativeFallback.enabled)) {
+			// CompactionErrorInfo is decoded to public, content-free vocabulary.
+			// Never expose provider-authored messages, response bodies or ciphertext here.
+			const failure = responsesOutcome.remoteFailure;
+			const diagnostic = failure ? [
+				failure.reason,
+				failure.status !== undefined ? `HTTP ${failure.status}` : undefined,
+				failure.errorCode,
+				failure.errorType ? `type=${failure.errorType}` : undefined,
+				failure.errorParam ? `param=${failure.errorParam}` : undefined,
+				failure.errorCategory ? `category=${failure.errorCategory}` : undefined,
+			].filter(Boolean).join(", ") : "unknown failure";
+			notifyWarning(ctx, `Remote compaction failed (${diagnostic}); text fallback is unsafe or disabled. History was left unchanged.`);
+			return { cancel: true };
+		}
 		if (responsesOutcome.remoteFailure) {
 			const failure = responsesOutcome.remoteFailure;
 			writeDebugArtifact("compaction-event", {
@@ -936,6 +1018,13 @@ async function handleSessionBeforeCompact(
 			);
 		}
 	}
+
+	if (projectCheckpoint) {
+		notifyWarning(ctx, "Remote compaction cancelled: an existing opaque checkpoint cannot fall back to a native text summary. History was left unchanged.");
+		return { cancel: true };
+	}
+
+	if (activation.projectPolicy && !config.nativeFallback.enabled) return { cancel: true };
 
 	// Branch 2: run pi's native compaction method. A failed remote request is compacted by the
 	// remote producer itself; a model that cannot use remote v2 at all uses nativeFallback.model.
@@ -1012,7 +1101,7 @@ async function handleContextInternal(
 	event: ContextWithSystemEvent,
 	ctx: ExtensionContext,
 	pi: ExtensionAPI,
-	loadConfig: typeof loadToolkitConfig,
+	loadConfig: ToolkitConfigReader,
 	contextWindows: CodexContextWindowManager,
 	remoteContextActive: RemoteContextActive,
 	getContextToolRegistrationState: ContextToolRegistrationStateReader,
@@ -1020,6 +1109,7 @@ async function handleContextInternal(
 	const resolved = contextOperation(loadConfig, ctx);
 	requireContextPolicy(resolved, ctx);
 	const config = resolved.config.compaction;
+	const projectCheckpoint = requireProjectCheckpointReplay(ctx, resolved);
 	if (!config.enabled) {
 		const visibleMessages = contextWindows.project(event.messages, "off");
 		return visibleMessages.length === event.messages.length && visibleMessages.every((message, index) => message === event.messages[index])
@@ -1138,15 +1228,16 @@ async function handleContextInternal(
 		responsesApis: inheritedCheckpoint ? undefined : config.responsesApis,
 		codexGatewayModels: compactGatewayModels(resolved),
 	});
+	const guardedCheckpoint = inheritedCheckpoint ?? projectCheckpoint;
 	if (!resolution.ok) {
-		return inheritedCheckpoint
-			? rejectInheritedCheckpointReplay(ctx, config, inheritedCheckpoint.id, resolution.reason)
+		return guardedCheckpoint
+			? rejectInheritedCheckpointReplay(ctx, config, guardedCheckpoint.id, resolution.reason)
 			: finishProjection(visibleMessages);
 	}
 	const latest = resolveLatestNativeCompactionEntry(branchEntries, { baseUrl: resolution.runtime.baseUrl });
 	if (!latest.ok) {
-		return inheritedCheckpoint
-			? rejectInheritedCheckpointReplay(ctx, config, inheritedCheckpoint.id, latest.reason)
+		return guardedCheckpoint
+			? rejectInheritedCheckpointReplay(ctx, config, guardedCheckpoint.id, latest.reason)
 			: finishProjection(visibleMessages);
 	}
 	const result = removeNativeCompactionRetainedMessages({
@@ -1174,7 +1265,7 @@ async function handleContext(
 	event: ContextWithSystemEvent,
 	ctx: ExtensionContext,
 	pi: ExtensionAPI,
-	loadConfig: typeof loadToolkitConfig,
+	loadConfig: ToolkitConfigReader,
 	contextWindows: CodexContextWindowManager,
 	remoteContextActive: RemoteContextActive,
 	getContextToolRegistrationState: ContextToolRegistrationStateReader,
@@ -1190,7 +1281,7 @@ async function handleContext(
 async function handleBeforeProviderRequest(
 	event: BeforeProviderRequestEvent,
 	ctx: ExtensionContext,
-	loadConfig: typeof loadToolkitConfig,
+	loadConfig: ToolkitConfigReader,
 	contextWindows: CodexContextWindowManager,
 	remoteContextActive: RemoteContextActive,
 	getContextToolRegistrationState: ContextToolRegistrationStateReader,
@@ -1199,6 +1290,7 @@ async function handleBeforeProviderRequest(
 	requireContextPolicy(resolved, ctx);
 	const toolkitConfig = resolved.config;
 	const config = toolkitConfig.compaction;
+	const projectCheckpoint = requireProjectCheckpointReplay(ctx, resolved);
 	if (!config.enabled) {
 		return undefined;
 	}
@@ -1262,8 +1354,9 @@ async function handleBeforeProviderRequest(
 		},
 		event.payload,
 	);
+	const guardedCheckpoint = inheritedCheckpoint ?? projectCheckpoint;
 	if (resolution.ok === false) {
-		if (inheritedCheckpoint) return rejectInheritedCheckpointReplay(ctx, config, inheritedCheckpoint.id, resolution.reason);
+		if (guardedCheckpoint) return rejectInheritedCheckpointReplay(ctx, config, guardedCheckpoint.id, resolution.reason);
 		writeDebugArtifact(
 			"provider-request",
 			{
@@ -1312,7 +1405,7 @@ async function handleBeforeProviderRequest(
 		baseUrl: runtime.baseUrl,
 	});
 	if (!latestNativeCompaction.ok) {
-		if (inheritedCheckpoint) return rejectInheritedCheckpointReplay(ctx, config, inheritedCheckpoint.id, latestNativeCompaction.reason);
+		if (guardedCheckpoint) return rejectInheritedCheckpointReplay(ctx, config, guardedCheckpoint.id, latestNativeCompaction.reason);
 		writeDebugArtifact(
 			"provider-request",
 			{
@@ -1412,17 +1505,17 @@ async function handleBeforeProviderRequest(
 	return rewrite.rewrittenPayload;
 }
 
-export default function registerCompactionExtension(
+function registerCompactionExtension(
 	pi: ExtensionAPI,
 	overrides: Partial<CompactionDependencies> = {},
 ) {
-	const loadConfig = overrides.loadConfig ?? loadToolkitConfig;
-	registerToolkitConfigCommand(pi, loadConfig);
-	const piContextHookPatch = installPiContextHookPatch();
+	const loadConfig = overrides.loadConfig ?? (() => loadToolkitConfig());
+	registerToolkitConfigCommand(pi, loadConfig, activation.projectPolicy);
+	const piContextHookPatch = (activation.installContextHookPatch ?? installPiContextHookPatch)();
 	const contextWindows = overrides.contextWindows ?? new CodexContextWindowManager((ctx, signal, gatewayModels) =>
-		loadHistoryNotesThreadHint(ctx, signal, gatewayModels)
+		loadHistoryNotesThreadHint(ctx, signal, gatewayModels, resolveProvider)
 	);
-	const manualCompact = new ManagedManualCompact(pi, contextWindows);
+	const manualCompact = new ManagedManualCompact(pi, contextWindows, undefined, resolveProvider);
 	const dependencies: CompactionDependencies = {
 		remoteCompact: executeRemoteV2Compaction,
 		standaloneCompact: executeNativeCompaction,
@@ -1430,9 +1523,11 @@ export default function registerCompactionExtension(
 		contextWindows,
 		...overrides,
 		manualCompact,
-		loadConfig: () => manualCompact.snapshot ?? loadConfig(),
+		loadConfig: (ctx) => manualCompact.snapshot ?? loadConfig(ctx),
 		piContextHookPatch: overrides.piContextHookPatch ?? piContextHookPatch,
 	};
+	const operationReader = activation.onOperationReader?.(dependencies.loadConfig);
+	if (operationReader) dependencies.loadConfig = operationReader;
 	let tools!: ReturnType<typeof registerContextManagementTools>;
 	let contextWindowReady = false;
 	const isContextRuntimeActive = async (
@@ -1451,6 +1546,7 @@ export default function registerCompactionExtension(
 		},
 		undefined,
 		manualCompact,
+		resolveProvider,
 	);
 	const remoteContextActive: RemoteContextActive = isContextRuntimeActive;
 	const syncTools = async (
@@ -1516,7 +1612,7 @@ export default function registerCompactionExtension(
 			} else if (syncOutcome.eligible && !syncOutcome.windowInitialized) {
 				activationReason = "malformed-window-state";
 			} else {
-				const remoteResolution = await resolveCodexContextProvider(ctx, ctx.model, config.gatewayContextModels);
+				const remoteResolution = await resolveProvider(ctx, ctx.model, config.gatewayContextModels);
 				activationReason = remoteResolution.ok ? "codex-context-unavailable" : remoteResolution.reason;
 				notifyRemoteContextFailure(ctx, activationReason);
 			}
@@ -1558,7 +1654,18 @@ export default function registerCompactionExtension(
 		manualCompact.guardRequest(ctx);
 		return handleContext(event, ctx, pi, dependencies.loadConfig, contextWindows, remoteContextActive, getContextToolRegistrationState);
 	});
-	pi.on("session_before_compact", (event, ctx) => handleSessionBeforeCompact(event, ctx, dependencies, remoteContextActive, getContextToolRegistrationState));
+	pi.on("session_before_compact", async (event, ctx) => {
+		try {
+			return await handleSessionBeforeCompact(event, ctx, dependencies, remoteContextActive, getContextToolRegistrationState);
+		} catch (error) {
+			// Preserve unrelated legacy error behavior; grammar refusal must never delegate.
+			if (!activation.projectPolicy && !(error instanceof GrammarToolSerializationError)) throw error;
+			// The SDK swallows hook errors, so throwing would delegate to its text compactor.
+			try { notifyWarning(ctx, "Remote compaction cancelled: request/context preparation failed. History was left unchanged."); }
+			catch { /* A disposed context must still cancel instead of delegating. */ }
+			return { cancel: true };
+		}
+	});
 	pi.on("session_compact", (_event, ctx) => contextWindows.synchronize(ctx));
 	pi.on("session_compact_failed", async (event, ctx) => {
 		if (event.reason === "manual" && !manualCompact.isMaintenance) await manualCompact.compactFailed(ctx);
@@ -1568,6 +1675,9 @@ export default function registerCompactionExtension(
 		contextWindowReady = false;
 		contextWindows.reset();
 		tools.reset();
+		requestCache.clearRequestContextCache();
+		runtime.reset();
+		notifier.reset();
 	});
 	pi.on("agent_settled", async (_event, ctx) => {
 		// Only the owned manual handoff restores/continues here; Pi owns normal
@@ -1596,9 +1706,14 @@ export default function registerCompactionExtension(
 		await manualCompact.recover(ctx);
 		await syncTools(ctx);
 	});
-	pi.on("before_provider_request", (event, ctx) => {
-		manualCompact.guardRequest(ctx);
-		return handleBeforeProviderRequest(event, ctx, dependencies.loadConfig, contextWindows, remoteContextActive, getContextToolRegistrationState);
+	pi.on("before_provider_request", async (event, ctx) => {
+		try {
+			manualCompact.guardRequest(ctx);
+			return await handleBeforeProviderRequest(event, ctx, dependencies.loadConfig, contextWindows, remoteContextActive, getContextToolRegistrationState);
+		} catch (error) {
+			if (activation.projectPolicy) ctx.abort();
+			throw error;
+		}
 	});
 	pi.on("before_provider_headers", async (event, ctx) => {
 		const resolved = contextOperation(dependencies.loadConfig, ctx);
@@ -1617,7 +1732,7 @@ export default function registerCompactionExtension(
 			}
 			return;
 		}
-		const provider = await resolveCodexContextProvider(ctx, ctx.model, config.gatewayContextModels);
+		const provider = await resolveProvider(ctx, ctx.model, config.gatewayContextModels);
 		if (provider.ok && provider.provider.kind === "codex-gateway") {
 			const sessionId = getSessionId(ctx);
 			const gatewayHeaders = codexContextProviderHeaders(provider.provider, {
@@ -1659,4 +1774,14 @@ export default function registerCompactionExtension(
 		const message = routeContextNamespaceToolMessage(event.message);
 		return message === event.message ? undefined : { message };
 	});
+}
+	return registerCompactionExtension;
+}
+
+/** Upstream entrypoint: prototype bridge remains enabled unless explicitly injected otherwise. */
+export default function registerCompactionExtension(
+	pi: ExtensionAPI,
+	overrides: NonNullable<Parameters<ReturnType<typeof createCompactionExtension>>[1]> = {},
+) {
+	return createCompactionExtension(overrides.activation)(pi, overrides);
 }

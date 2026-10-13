@@ -20,6 +20,8 @@
     "src/details-store.ts",
     "src/deferred-tool-carryover.ts",
     "src/extension-runtime.ts",
+    "src/thegame-extension.ts",
+    "src/thegame-policy.ts",
     "src/image-generation/artifacts.ts",
     "src/image-generation/client.ts",
     "src/image-generation/eligibility.ts",

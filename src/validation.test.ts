@@ -2,7 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
-import { clearRequestContextCache, getCompactionRequestExtras } from "./request-context-cache";
+import { createRequestContextCache } from "./request-context-cache-core";
+const requestCache = createRequestContextCache();
+const { clearRequestContextCache, getCompactionRequestExtras } = requestCache;
 import { transformWebSearchPayload } from "./web-search/payload";
 import { WEB_SEARCH_SOURCE_INCLUDE } from "./web-search/types";
 import {
@@ -41,6 +43,7 @@ type TestModel = {
 	input: string[];
 	reasoning: boolean;
 	compat?: {
+		supportsOpenAIGrammarTools?: boolean;
 		supportsAdditionalTools?: boolean;
 		supportsToolSearch?: boolean;
 		supportsExplicitPromptCacheMode?: boolean;
@@ -386,6 +389,7 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 		},
 		sendMessage: () => undefined,
 	} as never, {
+		activation: { requestCache },
 		loadConfig: () => ({
 			config: {
 				...DEFAULT_TOOLKIT_CONFIG,
@@ -473,6 +477,68 @@ afterEach(() => {
 	timestampCounter = 0;
 	clearRequestContextCache();
 	fs.rmSync(testArtifactRoot, { recursive: true, force: true });
+});
+
+for (const source of ["pi-context-hook", "legacy"] as const) {
+	for (const withCheckpoint of [false, true]) {
+		for (const invalid of ["declaration", "missing-input", "non-string-input"] as const) {
+			test(`legacy entrypoint cancels grammar ${invalid} (${source}, checkpoint=${withCheckpoint})`, async () => {
+				const { sessionBeforeCompact, compactCalls, fallbackCalls } = await loadHookHarness({
+					config: { remoteV2ContextSource: source, nativeFallback: { enabled: true } },
+				});
+				const model: TestModel = { ...defaultModel, compat: { supportsOpenAIGrammarTools: true } };
+				const declaration: TestSessionEntry = {
+					type: "message", id: "grammar-declaration", timestamp: nextTimestamp(),
+					message: { role: "system", content: "", timestamp: 1, toolsAdded: [{
+						name: "script", description: "synthetic grammar tool",
+						parameters: { type: "object", properties: { source: { type: "string" } },
+							required: invalid === "declaration" ? ["secret-field"] : ["source"] },
+						constrainedSampling: { type: "grammar", variants: { openai_regex: ".*" } },
+					}] },
+				};
+				const branchEntries = [declaration];
+				if (withCheckpoint) branchEntries.push(createCompactionEntry({
+					id: "grammar-checkpoint", firstKeptEntryId: "grammar-checkpoint", model,
+					inputProvenance: source === "legacy" ? LEGACY_REMOTE_V2_INPUT_PROVENANCE : NATIVE_COMPACTION_INPUT_PROVENANCE,
+					compactedWindow: [{ type: "compaction", encrypted_content: "synthetic-opaque" }],
+				}));
+				branchEntries.push(createUserEntry("grammar-user", "synthetic request"), createAssistantEntry(
+					"grammar-call", [createToolCallBlock("grammar-call", "script",
+						invalid === "missing-input" ? {} : { source: invalid === "non-string-input" ? { secret: "payload" } : "return 1" },
+						"ctc_grammar")], model, "toolUse",
+				));
+				const before = structuredClone(branchEntries);
+				const notifications: Array<{ message: string; level: string }> = [];
+				const ctx = createContext({ branchEntries, model, notifications });
+				const result = await sessionBeforeCompact({
+					signal: new AbortController().signal, reason: "manual", branchEntries: linkBranch(branchEntries),
+					preparation: { firstKeptEntryId: "grammar-user", tokensBefore: 512,
+						messagesToSummarize: ctx.sessionManager.buildSessionProjection().messages, turnPrefixMessages: [] },
+				}, ctx);
+				expect(result).toEqual({ cancel: true });
+				expect(compactCalls).toHaveLength(0);
+				expect(fallbackCalls).toHaveLength(0);
+				expect(branchEntries).toEqual(before);
+				expect(notifications).toHaveLength(1);
+				expect(notifications[0].message).toContain("request/context preparation failed");
+				expect(JSON.stringify(notifications)).not.toContain("secret-field");
+				expect(JSON.stringify(notifications)).not.toContain("payload");
+			});
+		}
+	}
+}
+
+test("grammar cancellation does not swallow unrelated legacy preparation errors", async () => {
+	const { sessionBeforeCompact, compactCalls, fallbackCalls } = await loadHookHarness();
+	const error = new Error("unrelated preparation failure");
+	const ctx = createContext();
+	ctx.getSystemPrompt = () => { throw error; };
+	await expect(sessionBeforeCompact({
+		signal: new AbortController().signal,
+		preparation: { firstKeptEntryId: "unused", tokensBefore: 512, messagesToSummarize: [], turnPrefixMessages: [] },
+	}, ctx)).rejects.toBe(error);
+	expect(compactCalls).toHaveLength(0);
+	expect(fallbackCalls).toHaveLength(0);
 });
 
 test("remote compaction cancels when raw custom content lacks a host projection", async () => {
