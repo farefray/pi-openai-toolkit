@@ -816,49 +816,48 @@ async function handleSessionBeforeCompact(
 	let projectCheckpoint;
 	try { projectCheckpoint = requireProjectCheckpointReplay(ctx, resolved); }
 	catch { return { cancel: true }; }
-	if (!config.enabled) {
-		return undefined;
-	}
-	if (activation.projectPolicy && config.contextManagement !== "remote" && config.remoteV2ContextSource === "pi-context-hook"
+	if (config.enabled && activation.projectPolicy && config.contextManagement !== "remote" && config.remoteV2ContextSource === "pi-context-hook"
 		&& !dependencies.projectCompactionContext && !getPiContextHookProjector(ctx)) {
 		notifyWarning(ctx, "Remote V2 compaction cancelled: ordered context-hook projection is unavailable; history was left unchanged.");
 		return { cancel: true };
 	}
+	if (config.enabled) {
+		writeDebugArtifact(
+			"compaction-event",
+			{
+				event: "session_before_compact",
+				customInstructions: event.customInstructions,
+				preparation: {
+					tokensBefore: event.preparation.tokensBefore,
+					firstKeptEntryId: event.preparation.firstKeptEntryId,
+					previousSummaryPresent: Boolean(event.preparation.previousSummary),
+					messagesToSummarizeCount: event.preparation.messagesToSummarize.length,
+					turnPrefixMessagesCount: event.preparation.turnPrefixMessages.length,
+				},
 
-	writeDebugArtifact(
-		"compaction-event",
-		{
-			event: "session_before_compact",
-			customInstructions: event.customInstructions,
-			preparation: {
-				tokensBefore: event.preparation.tokensBefore,
-				firstKeptEntryId: event.preparation.firstKeptEntryId,
-				previousSummaryPresent: Boolean(event.preparation.previousSummary),
-				messagesToSummarizeCount: event.preparation.messagesToSummarize.length,
-				turnPrefixMessagesCount: event.preparation.turnPrefixMessages.length,
 			},
-		},
-		config,
-		ctx,
-	);
+			config,
+			ctx,
+		);
+	}
 
 	if (event.signal.aborted) {
 		return { cancel: true };
 	}
 
-	// Capability changes do not retire the persisted Remote session. Resolve its
-	// branch boundary before deciding whether any compactor may see this input.
-	if (config.contextManagement === "remote") {
-		try {
-			dependencies.contextWindows.synchronize(ctx);
-		} catch {
-			notifyRemoteContextFailure(ctx, "malformed-window-state");
-			return { cancel: true };
-		}
+	// Window ownership survives model-policy changes, including Pi/disabled mode.
+	// Resolve it before any ordinary or default compactor can receive this input.
+	try {
+		dependencies.contextWindows.synchronize(ctx);
+	} catch {
+		notifyRemoteContextFailure(ctx, "malformed-window-state");
+		return { cancel: true };
 	}
 
 	// Active and inactive covered Codex consumers retain their existing routing.
-	const contextModel = await resolveContextCapabilityModel(ctx);
+	const contextModel = config.enabled && config.contextManagement === "remote"
+		? await resolveContextCapabilityModel(ctx)
+		: undefined;
 	if (isCodexContextModel(contextModel, config)) {
 		if (await remoteContextActive(ctx, config, contextModel)) {
 			try {
@@ -888,17 +887,16 @@ async function handleSessionBeforeCompact(
 		);
 	}
 
-	if (config.contextManagement === "remote") {
-		try {
-			const detached = dependencies.contextWindows.prepareDetachedCompaction(event);
-			// A local consumer cannot summarize history owned by a Remote window,
-			// even through a configured Luna producer or Pi's default compactor.
-			if (detached) return detached;
-		} catch {
-			notifyRemoteContextFailure(ctx, "malformed-window-state");
-			return { cancel: true };
-		}
+	try {
+		const detached = dependencies.contextWindows.prepareDetachedCompaction(event);
+		// A local consumer cannot summarize history owned by a Remote window,
+		// even after switching modes or disabling Toolkit compaction.
+		if (detached) return detached;
+	} catch {
+		notifyRemoteContextFailure(ctx, "malformed-window-state");
+		return { cancel: true };
 	}
+	if (!config.enabled) return undefined;
 
 	// Resolve producer protocol policy from this operation's document, not a later disk read.
 	if (resolved.format === "v2" && config.remoteCompactModel) {
@@ -1110,26 +1108,23 @@ async function handleContextInternal(
 	requireContextPolicy(resolved, ctx);
 	const config = resolved.config.compaction;
 	const projectCheckpoint = requireProjectCheckpointReplay(ctx, resolved);
-	if (!config.enabled) {
-		const visibleMessages = contextWindows.project(event.messages, "off");
-		return visibleMessages.length === event.messages.length && visibleMessages.every((message, index) => message === event.messages[index])
-			? undefined
-			: { messages: visibleMessages };
+	try {
+		contextWindows.synchronize(ctx);
+	} catch {
+		notifyRemoteContextFailure(ctx, "malformed-window-state");
+		reportPiContextHookFailure(ctx, "malformed-window-state");
+		ctx.abort();
+		return undefined;
+
 	}
 
 	let localMessages: AgentMessage[] | undefined;
 	let remoteReplayProjection = false;
-	if (config.contextManagement === "remote") {
+	// Disabled and intentionally downgraded runtimes never enter opaque replay,
+	// but still honor a window already owned by this session.
+	let localProjectionOnly = !config.enabled;
+	if (config.enabled && config.contextManagement === "remote") {
 		const contextModel = await resolveContextCapabilityModel(ctx);
-		try {
-			contextWindows.synchronize(ctx);
-		} catch {
-			notifyRemoteContextFailure(ctx, "malformed-window-state");
-			reportPiContextHookFailure(ctx, "malformed-window-state");
-			ctx.abort();
-			return undefined;
-		}
-
 		const remoteActive = await remoteContextActive(ctx, config, contextModel);
 		if (remoteActive) {
 			try {
@@ -1168,42 +1163,34 @@ async function handleContextInternal(
 		// downgrade; active Remote can replay a newer inherited checkpoint.
 		if (!remoteActive && isCodexContextModel(contextModel, config)) {
 			const registrationState = getContextToolRegistrationState();
-			if (isExcludedGatewayContext(contextModel, config, registrationState)) {
-				const visibleMessages = contextWindows.project(event.messages, "off");
-				return visibleMessages.length === event.messages.length && visibleMessages.every((message, index) => message === event.messages[index])
-					? undefined
-					: { messages: visibleMessages };
-			}
-			if (isCodexGatewayModel(contextModel, config.gatewayContextModels)) {
+			if (!isExcludedGatewayContext(contextModel, config, registrationState)
+				&& isCodexGatewayModel(contextModel, config.gatewayContextModels)) {
 				const reason = contextManagementFailureReason(registrationState);
 				notifyRemoteContextFailure(ctx, reason);
 				reportPiContextHookFailure(ctx, reason);
 				ctx.abort();
 				return undefined;
 			}
-			const visibleMessages = contextWindows.project(event.messages, "off");
-			return visibleMessages.length === event.messages.length && visibleMessages.every((message, index) => message === event.messages[index])
-				? undefined
-				: { messages: visibleMessages };
+			localProjectionOnly = true;
 		}
+	}
 
-		if (!remoteActive) {
-			try {
-				const projected = contextWindows.project(event.messages, "local");
-				localMessages = projected;
-				if (contextWindows.hasEffectiveWindow()) {
-					// This boundary owns earlier history, including any older Remote V2
-					// checkpoint. A local request must not replay that history back in.
-					return projected.length === event.messages.length && projected.every((message, index) => message === event.messages[index])
-						? undefined
-						: { messages: projected };
-				}
-			} catch (error) {
-				notifyRemoteContextFailure(ctx, "malformed-window-state");
-				reportPiContextHookFailure(ctx, error instanceof Error ? error.message : String(error));
-				ctx.abort();
-				return undefined;
+	if (!remoteReplayProjection) {
+		try {
+			const projected = contextWindows.project(event.messages, "local");
+			localMessages = projected;
+			if (localProjectionOnly || contextWindows.hasEffectiveWindow()) {
+				// A persisted boundary owns earlier history regardless of the selected
+				// mode. Neither disabled policy nor ordinary replay may expand it.
+				return projected.length === event.messages.length && projected.every((message, index) => message === event.messages[index])
+					? undefined
+					: { messages: projected };
 			}
+		} catch (error) {
+			notifyRemoteContextFailure(ctx, "malformed-window-state");
+			reportPiContextHookFailure(ctx, error instanceof Error ? error.message : String(error));
+			ctx.abort();
+			return undefined;
 		}
 	}
 
@@ -1291,6 +1278,14 @@ async function handleBeforeProviderRequest(
 	const toolkitConfig = resolved.config;
 	const config = toolkitConfig.compaction;
 	const projectCheckpoint = requireProjectCheckpointReplay(ctx, resolved);
+	try {
+		contextWindows.synchronize(ctx);
+	} catch {
+		notifyRemoteContextFailure(ctx, "malformed-window-state");
+		ctx.abort();
+		return undefined;
+	}
+
 	if (!config.enabled) {
 		return undefined;
 	}
@@ -1298,15 +1293,6 @@ async function handleBeforeProviderRequest(
 	const contextModel = config.contextManagement === "remote"
 		? await resolveContextCapabilityModel(ctx)
 		: undefined;
-	if (config.contextManagement === "remote") {
-		try {
-			contextWindows.synchronize(ctx);
-		} catch {
-			notifyRemoteContextFailure(ctx, "malformed-window-state");
-			ctx.abort();
-			return undefined;
-		}
-	}
 	const remoteActive = config.contextManagement === "remote" && await remoteContextActive(ctx, config, contextModel);
 	let remotePayload: unknown;
 	if (remoteActive) {
@@ -1339,7 +1325,7 @@ async function handleBeforeProviderRequest(
 
 	// Do not reintroduce a pre-window opaque checkpoint after local projection.
 	// Request affinity/encrypted-output rewriting is reserved for active Remote.
-	if (config.contextManagement === "remote" && contextWindows.hasEffectiveWindow()) return undefined;
+	if (contextWindows.hasEffectiveWindow()) return undefined;
 
 	const branchEntries = ctx.sessionManager.getBranch();
 	const inherited = config.contextManagement === "remote" && contextWindows.hasSupersededWindow()

@@ -2,6 +2,16 @@
 
 Upstream baseline: `9844924f82c21937cf3c54942cec5af0b57dab6d`, toolkit `0.21.0`, dev SDK `1.0.0`. Branch: `thegame`. Локальні patches перелічено нижче; Git commit не означає push, publish або rollout.
 
+## Source integration 0.22.2 — 2026-10-17
+
+За прямим запитом користувача ([thegame W-094](../../thegame/docs/work/W-094-harness-fork-ecosystem.md)) fetched `upstream/main` `973e901bbc86f07e5c0c1948e20624e6dd366364` інтегровано поверх `4952e0e4d8a225075e01dd4ed970fa5be574de9a`. Спочатку підготовлено `--no-commit` merge; наступним прямим запитом користувач дозволив merge commit лише в tooling repos, без commit у thegame. Один conflict file, `src/extension-runtime.ts`: private checkpoint replay/provenance/fallback guards збережено перед disabled exits, upstream window boundaries перевіряються незалежно від поточного mode. Safe entrypoint/policy files та project settings незмінні; новий Fast root resource не включений до safe composition. Images/WS лишаються excluded. Dependencies незмінні, manifest/lock version-only update не потребував install.
+
+Main: own dev-SDK1.0 typecheck PASS; before full **809 PASS / 1 FAIL**, final full **1024 PASS / 1 та сама FAIL**, 0 added/removed failing names; full не overall PASS. Baseline optional actual-SDK mock запускається без заданого SDK path у цьому Bun run і відмовляє на missing argument; він не пропущений/не послаблений заради green. Перший post run мав п'ять нових fixture failures: мінімальний compaction event не мав `signal`/`branchEntries`, root manifest assertion очікував п'ять resources. Inputs приведено до SDK shape, root assertion — exact six-member array, safe command `fast` explicitly absent; усі zero-dispatch/native-context assertions збережено. Safe focused25PASS.
+
+Actual selected safe source + host **SDK1.3.0** / RPC / ordered projector: **74 PASS / 0 FAIL / 0 SKIP**, synthetic models/credentials, denied inference, loader/reload/reopen/concurrent activation/checkpoint projection. Host fixture звіряє exact SDK із host manifest замість stale1.1. Це не live/provider/browser/child execution чи memory-quality acceptance. Під час verification commit/push не виконувалися; наступний дозвіл на tooling commit не включає push, reload/restart/activation або зміни credentials, settings чи user sessions. Evidence і попередні failed runs: thegame `bin/qa/harness/harness-forks-20261017-DtsYgp/verification.md`.
+
+## Private patch provenance
+
 | Patch | Scope і provenance | Межі / verification |
 |---|---|---|
 | P01 | W-074 S1/S3: opt-in `thegame` subpackage, trusted project-v2 policy; safe compaction/search/Astra без Images/WS/prototype install. Activation-owned caches, injected provider chain, shared guarded manual-handoff reader. Upstream facade APIs/root `pi.extensions` збережено; package `files` доповнено cores/safe source/docs. | Main: SDK1.0 і SDK1.1 typechecks PASS; full **758 PASS / 2 upstream-baseline Windows image FAIL**; actual SDK1.1/web **9 PASS**. Independent review snapshot finding виправлено й re-reviewed. Default provider/model і role grants не змінено; actual browser/child/checkpoint continuity NOT-RUN. |

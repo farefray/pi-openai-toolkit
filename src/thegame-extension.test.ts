@@ -192,6 +192,7 @@ test("factory-only safe load registers once, reads no policy, and leaves SDK pro
 		expect(ExtensionRunner.prototype.createContext).toBe(prototype);
 		expect(getApiProviders()).toEqual(providers);
 		expect(host.commands.size).toBe(1);
+		expect(host.commands.has("fast")).toBe(false);
 		expect(host.definitions.map((tool) => tool.name)).not.toContain("openai_generate_image");
 	} finally { globalThis.fetch = originalFetch; globalThis.setTimeout = originalTimeout; globalThis.setInterval = originalInterval; }
 });
@@ -346,7 +347,9 @@ for (const id of ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-luna", "unconfigured-mo
 		expect(host.active()).toContain("exa_search");
 		for (const tool of ["history", "notes", "new_context", "get_context_remaining", "web_run"])
 			expect(host.active()).not.toContain(tool);
-		const compaction = await host.emit("session_before_compact", { preparation: {} }, ctx);
+		const compaction = await host.emit("session_before_compact", {
+			signal: new AbortController().signal, branchEntries: ctx.sessionManager.getBranch(), preparation: {},
+		}, ctx);
 		expect(compaction.every((result) => result === undefined)).toBe(true);
 		expect(remoteCalls).toBe(0);
 		writeFileSync(file, JSON.stringify({ ...policy, models: {} }));
@@ -361,5 +364,9 @@ test("selected subpackage exposes only safe resource and root manifest keeps ups
 	const selected = JSON.parse(readFileSync(new URL("../thegame/package.json", import.meta.url), "utf8"));
 	const root = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 	expect(selected.pi.extensions).toEqual(["../src/thegame-extension.ts"]);
-	expect(root.pi.extensions).not.toContain("./src/thegame-extension.ts"); expect(root.pi.extensions).toHaveLength(5);
+	expect(root.pi.extensions).not.toContain("./src/thegame-extension.ts");
+	expect(root.pi.extensions).toEqual([
+		"./src/extension-runtime.ts", "./src/web-search/extension.ts", "./src/image-generation/extension.ts",
+		"./src/codex-fast/extension.ts", "./src/codex-astra/extension.ts", "./src/responses-websocket/extension.ts",
+	]);
 });

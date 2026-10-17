@@ -1,6 +1,6 @@
 # Safe інтеграція для thegame / pi-web
 
-Цей fork має окремий opt-in entrypoint `src/thegame-extension.ts`. Він композиційно реєструє compaction, Web Search і Codex Astra; Images та Responses WebSocket не імпортує і не реєструє. Це локальна shared-host адаптація, не підтвердження provider capabilities чи дозвіл remote compaction.
+Цей fork має окремий opt-in entrypoint `src/thegame-extension.ts`. Він композиційно реєструє compaction, Web Search і Codex Astra; Images, Responses WebSocket та Codex Fast не імпортує і не реєструє. Це локальна shared-host адаптація, не підтвердження provider capabilities чи дозвіл remote compaction.
 
 ## Вибір package source
 
@@ -14,7 +14,13 @@
 }
 ```
 
-Root `pi.extensions` зберігає п'ять upstream resources і upstream поведінку. `files` розширено новими runtime cores, safe source/subpackage і fork docs, щоб npm packing не втратив нових relative imports; це не активує safe composition під час root load. Одночасне завантаження root package та safe підпакета не підтримується: це два набори handlers/tools/commands. Main має перевірити фактичні loaded resources та єдиного compaction producer. Вибір source/settings, rollout і конфлікти з іншими compaction extensions належать інтеграційному зрізу main.
+Root `pi.extensions` зберігає шість upstream resources (від 0.22.2 також Codex Fast) і upstream поведінку. `files` розширено новими runtime cores, safe source/subpackage і fork docs, щоб npm packing не втратив нових relative imports; це не активує safe composition під час root load. Одночасне завантаження root package та safe підпакета не підтримується: це два набори handlers/tools/commands. Main має перевірити фактичні loaded resources та єдиного compaction producer. Вибір source/settings, rollout і конфлікти з іншими compaction extensions належать інтеграційному зрізу main.
+
+## Upstream 0.22.2 / host SDK 1.3 compatibility
+
+Source інтеграція `973e901` поверх private `4952e0e` спочатку підготовлена як no-commit merge; користувач окремо дозволив merge commit у tooling repo без push чи activation. Нові window-boundary checks працюють також у Pi/disabled modes, не активуючи Remote Windows. Project opaque checkpoint guards лишаються до disabled exits, explicit nativeFallback off і fail-closed projection збережено. New Fast resource належить лише root composition; safe package не реєструє `/fast` і не змінює `service_tier` цим feature. WS лишається excluded.
+
+Own dev-SDK 1.0 typecheck PASS; full 1024 PASS / 1 та сама baseline failure (optional SDK mock без SDK path), не overall PASS. Main actual host SDK1.3/selected safe entrypoint + RPC/projector matrix: 74 PASS / 0 FAIL / 0 SKIP, denied inference та synthetic data. Safe policy/factory focused25PASS. Test fixtures дають SDK-shaped `signal`/`branchEntries`, а manifest assertion точно зберігає safe-versus-six-root distinction; original no-dispatch assertions не послаблені. Source merge не є activation, live recall/entitlement/usage proof або session migration. Commands, ранні failures й межі — thegame `bin/qa/harness/harness-forks-20261017-DtsYgp/verification.md`, W-094 (перенумеровано після verification); current project owner — `docs/features/harness/openai-toolkit.md` у thegame.
 
 ## S4 host projection і persisted safety
 

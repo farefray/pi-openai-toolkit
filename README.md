@@ -58,9 +58,17 @@ Set `context.remoteCompaction.model` to use a separate producer on the same effe
 
 **Remote windows** require the native `openai-codex` provider with `openai-codex-responses`, or an `openai-responses` gateway implementing the protocol. Gateways require `compatibility.transport: "codex-gateway"` on the exact model entry. This setting does not add the capability to an ordinary compatible endpoint.
 
-Change `mode` in the example above to `remote-windows`. Eligible sessions expose `new_context`, `get_context_remaining`, `history`, and `notes`. Manual `/compact [instructions]` starts a checkpoint handoff: write notes successfully, then switch windows. Models without window capability use only the current local window projection: retired Remote Context history is not sent to the model or to a configured compaction producer. A no-summary local boundary preserves the persisted Remote Window / Context Session, so switching back to a supported model reuses the same window instead of opening a duplicate one. The legacy `leaveManagedMode` setting is retained for config compatibility but no longer triggers bulk close-out compaction.
+Change `mode` in the example above to `remote-windows`. Eligible sessions expose `new_context`, `get_context_remaining`, `history`, and `notes`. Manual `/compact [instructions]` starts a checkpoint handoff: write notes successfully, then switch windows. An existing effective window boundary survives model changes and switches to `remote-compaction` or `pi`: only the current local window is used, and retired Remote Context history is not sent to the model or a compaction producer. A no-summary local boundary preserves the persisted Remote Window / Context Session, so switching back to a supported model reuses the same window instead of opening a duplicate one. The legacy `leaveManagedMode` setting is retained for config compatibility but no longer triggers bulk close-out compaction.
 
 Remote windows use alpha endpoints that may change upstream. When switching models, the remote window remains persisted and reusable; see the [window lifecycle](docs/internals.md#rollover-lifecycle).
+
+## Codex Fast
+
+Fast is OFF by default. Run `/fast` in Pi's terminal or a UI-backed RPC client such as pi-web to turn it ON, then run it again to turn it OFF. Notifications confirm changes; the status is `Fast ON`, `Fast OFF`, or `Fast N/A` for an ineligible route, with display placement controlled by the client. Print/JSON and headless commands cannot toggle Fast. No Fast configuration is needed.
+
+Supports native Codex and recognizable GPT/Codex models on compatible Responses gateways. The selection is saved only in the current session: reload/resume and `new_context` retain it; new or forked sessions start OFF. ON requests Fast, while OFF requests Standard, overriding an existing service-tier preference on eligible conversation requests without changing reasoning effort or configuration files.
+
+Fast may increase usage/cost. The indicator shows the requested mode, not confirmed backend acceleration; a gateway may reject, ignore, or downgrade it. Opaque gateway model aliases need an existing Codex gateway identity. See the [Fast contract](docs/internals.md#codex-fast-session-control) for scope and lifecycle details.
 
 ## Search, images, and transport
 
