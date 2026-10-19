@@ -1070,7 +1070,12 @@ test("legacy recursive Remote V2 uses the raw branch tail and stores the legacy 
 			messagesToSummarize: [],
 			turnPrefixMessages: [],
 		},
-	} as never, createContext({ branchEntries }))) as {
+	} as never, createContext({ branchEntries, sessionContextMessages: [
+		createCompactionSummaryMessage(previousCompaction),
+		toReplayMessage(branchEntries[0]),
+		toReplayMessage(tailCustom),
+		toReplayMessage(tailUser),
+	] }))) as {
 		compaction: { details: { inputProvenance: string } };
 	};
 	const input = (compactCalls[0]?.request as { input: unknown[] }).input;
@@ -1411,7 +1416,7 @@ test("first native compaction sends the full current session context, including 
 });
 
 test("repeated native compaction reuses the latest stored compacted window instead of Pi's shim summary", async () => {
-	const { sessionBeforeCompact, compactCalls } = await loadHookHarness();
+	const { sessionBeforeCompact, compactCalls, fallbackCalls } = await loadHookHarness();
 	const model = { ...defaultModel };
 	const oldKeptUser = createUserEntry("old_kept_user", "Original context before native compaction.");
 	const compactedWindow = [
@@ -1456,14 +1461,33 @@ test("repeated native compaction reuses the latest stored compacted window inste
 		},
 	};
 
+	const branchEntries = [oldKeptUser, olderCompaction, priorCompaction, tailUser, tailAssistant];
+	const branchBefore = structuredClone(branchEntries);
+	const ambiguousMessages = [
+		createCompactionSummaryMessage(olderCompaction),
+		createCompactionSummaryMessage(priorCompaction),
+		toReplayMessage(tailUser),
+		toReplayMessage(tailAssistant),
+	];
+	const ambiguousBefore = structuredClone(ambiguousMessages);
+	// Keep the old two-summary setup as refusal coverage: it is not a canonical
+	// SDK projection and cannot identify one unique wire summary to replace.
+	expect(await sessionBeforeCompact(event, createContext({
+		branchEntries, model, systemPrompt: "Current instructions v-repeat",
+		sessionContextMessages: ambiguousMessages,
+	}))).toEqual({ cancel: true });
+	expect(compactCalls).toHaveLength(0);
+	expect(fallbackCalls).toHaveLength(0);
+	expect(branchEntries).toEqual(branchBefore);
+	expect(ambiguousMessages).toEqual(ambiguousBefore);
+
 	await sessionBeforeCompact(
 		event,
 		createContext({
-			branchEntries: [oldKeptUser, olderCompaction, priorCompaction, tailUser, tailAssistant],
+			branchEntries,
 			model,
 			systemPrompt: "Current instructions v-repeat",
 			sessionContextMessages: [
-				createCompactionSummaryMessage(olderCompaction),
 				createCompactionSummaryMessage(priorCompaction),
 				toReplayMessage(tailUser),
 				toReplayMessage(tailAssistant),

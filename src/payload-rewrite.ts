@@ -10,6 +10,7 @@ import type {
 	NativeCompactionInputProvenance,
 } from "./types";
 import {
+	applyModelImageInputLimits,
 	serializeMessagesToResponsesInput,
 	serializeMessagesToResponsesInputWithLimits,
 	type ResponsesInputContentItem,
@@ -383,6 +384,25 @@ export async function serializeLiveTailToResponsesInputWithLimits<TApi extends A
 		firstSystemMessageIsUpdate: true,
 		grammarToolInputProperties: args.grammarToolInputProperties,
 	});
+}
+
+/**
+ * The caller supplies the full SAFE canonical projection (retained copies already
+ * removed). Serialize before selecting a tail: declarations and unsigned message
+ * indexes belong to that full context, never to opaque wire length or raw history.
+ * Only the selected tail consumes the new request's image budget.
+ */
+export async function serializeNativeCompactionTailWithLimits<TApi extends Api>(args: {
+	model: Model<TApi>;
+	messages: AgentMessage[];
+	summary: string;
+}): Promise<ResponsesInputItem[] | undefined> {
+	const summaries = args.messages.filter((message) => message.role === "compactionSummary" && message.summary === args.summary);
+	if (summaries.length !== 1) return undefined;
+	const input = serializeMessagesToResponsesInput(args.model, args.messages);
+	const summaryIndex = findCompactionSummaryIndex(input, args.summary);
+	if (summaryIndex < 0 || findCompactionSummaryIndex(input.slice(summaryIndex + 1), args.summary) >= 0) return undefined;
+	return applyModelImageInputLimits(args.model, input.slice(summaryIndex + 1));
 }
 
 function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {

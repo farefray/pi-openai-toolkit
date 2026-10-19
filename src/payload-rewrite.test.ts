@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, expect, test } from "bun:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, resolveTranscriptTools, type Api, type Model } from "@earendil-works/pi-ai";
+import { convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { resolveLatestNativeCompactionEntry } from "./details-store";
-import { removeNativeCompactionRetainedMessages, serializeLiveTailToResponsesInput, serializeLiveTailToResponsesInputWithLimits, rewriteResponsesPayloadWithNativeReplay } from "./payload-rewrite";
-import { getGrammarToolInputProperties } from "./serializer";
+import { removeNativeCompactionRetainedMessages, serializeLiveTailToResponsesInput, serializeLiveTailToResponsesInputWithLimits, serializeNativeCompactionTailWithLimits, rewriteResponsesPayloadWithNativeReplay } from "./payload-rewrite";
+import { getGrammarToolInputProperties, serializeMessagesToResponsesInput } from "./serializer";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { createCompactionExtension } from "./extension-runtime";
+import { createRequestContextCache } from "./request-context-cache-core";
+import { getRemoteV2InputProvenance, DEFAULT_TOOLKIT_CONFIG } from "./types";
+import type { NativeCompactionRequestBody } from "./serializer";
 import {
 	createNativeCompactionDetails,
 	NATIVE_COMPACTION_FALLBACK_SUMMARY,
@@ -310,6 +316,192 @@ describe("latest Pi retained context", () => {
 	});
 });
 
+
+describe("recursive compaction dispatch envelope", () => {
+	function harness(source: "legacy" | "pi-context-hook", messages: AgentMessage[], branchEntries: ReturnType<SessionManager["getBranch"]>,
+		model: Model<Api>, project?: (messages: readonly AgentMessage[]) => readonly AgentMessage[]) {
+		const handlers = new Map<string, (event: any, ctx: any) => Promise<any>>();
+		const requests: NativeCompactionRequestBody[] = [];
+		let fallback = 0;
+		const cache = createRequestContextCache();
+		const ctx = { cwd: process.env.TEMP!, model, hasUI: true, ui: { notify() {} }, abort() {},
+			getSystemPrompt: () => "current instructions", sessionManager: {
+				getSessionId: () => "codec-worker", getBranch: () => branchEntries,
+				buildSessionProjection: () => ({ messages: structuredClone(messages) }),
+			}, modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "synthetic-not-a-credential" }) },
+		};
+		createCompactionExtension({ requestCache: cache,
+			installContextHookPatch: () => ({ ok: false, reason: "disabled-by-policy" }) })(
+			{ on: (name: string, handler: any) => handlers.set(name, handler), registerTool() {}, getAllTools: () => [], getActiveTools: () => [] } as never,
+			{ loadConfig: () => ({ config: { ...DEFAULT_TOOLKIT_CONFIG, compaction: { ...DEFAULT_TOOLKIT_CONFIG.compaction,
+				remoteV2ContextSource: source, artifactRoot: process.env.TEMP! } }, warnings: [] }),
+				projectCompactionContext: project ?? ((messages) => messages),
+				remoteCompact: async (args) => { requests.push(structuredClone(args.request)); return {
+					ok: true, status: 200, compactedWindow: [{ type: "compaction", encrypted_content: "next-opaque" }],
+					createdAt: "2026-10-19T00:00:00Z", response: {},
+				} as never; },
+				standaloneCompact: async () => { throw new Error("unexpected standalone dispatch"); },
+				nativeFallback: async () => { fallback++; throw new Error("unexpected summary fallback"); },
+			});
+		return { requests, cache, get fallback() { return fallback; }, run: () => handlers.get("session_before_compact")!({
+			reason: "manual", branchEntries, signal: new AbortController().signal,
+			preparation: { firstKeptEntryId: "keep", tokensBefore: 100, messagesToSummarize: [], turnPrefixMessages: [] },
+		}, ctx) };
+	}
+	const model: Model<"openai-codex-responses"> = { ...liveTailModel, api: "openai-codex-responses",
+		compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true, supportsToolSearch: true, supportsOpenAIGrammarTools: true } };
+
+	for (const source of ["legacy", "pi-context-hook"] as const) test(`${source}: full safe context before wire split, opaque window once, cached top-level tools authoritative`, async () => {
+		const manager = SessionManager.inMemory("C:/offline");
+		const tool = { name: "script", description: "offline", parameters: { type: "object", properties: { source: { type: "string" } }, required: ["source"] },
+			constrainedSampling: { type: "grammar", variants: { openai_lark: "start: /.+/" } } };
+		manager.appendMessage({ role: "system", content: "initial", toolsAdded: [tool], timestamp: 1 } as never);
+		const kept = manager.appendMessage({ role: "user", content: "SEALED_RAW_HISTORY", timestamp: 2 });
+		const opaque = [{ role: "user", content: "provider-kept", future: { exact: true } },
+			{ type: "compaction", encrypted_content: "opaque" }, { role: "assistant", content: "provider-post" }];
+		manager.appendCompaction(NATIVE_COMPACTION_FALLBACK_SUMMARY, kept, 100, createNativeCompactionDetails({
+			provider: model.provider, api: model.api, model: model.id, baseUrl: model.baseUrl,
+			inputProvenance: getRemoteV2InputProvenance(source), compactedWindow: opaque,
+		}));
+		manager.appendMessage({ role: "system", content: "", timestamp: 3 } as never);
+		manager.appendMessage({ ...fauxAssistantMessage([{ type: "text", text: "unsigned" },
+			fauxToolCall("script", { source: "return 1" }, { id: "call_script|ctc_script" })], { timestamp: 4, stopReason: "toolUse" }),
+			provider: model.provider, api: model.api, model: model.id });
+		manager.appendMessage({ role: "toolResult", toolCallId: "call_script|ctc_script", toolName: "script", content: [{ type: "text", text: "1" }], isError: false, timestamp: 5 });
+		const branchEntries = manager.getBranch();
+		const before = structuredClone(branchEntries);
+		const latest = resolveLatestNativeCompactionEntry(branchEntries, { baseUrl: model.baseUrl });
+		assert(latest.ok);
+		const messages = manager.buildSessionProjection().messages;
+		const safe = removeNativeCompactionRetainedMessages({ messages, branchEntries, compactionEntry: latest.entry, expectedInputProvenance: getRemoteV2InputProvenance(source) });
+		assert(safe.ok);
+		const worker = harness(source, messages, branchEntries, model, () => safe.messages);
+		const cachedTools = [{ type: "custom", name: "cache-authority", format: { type: "grammar", syntax: "regex", definition: ".*" } }];
+		worker.cache.rememberRequestContext({ model: model.id, input: [], tools: cachedTools }, {
+			provider: model.provider, api: model.api, model: model.id, baseUrl: model.baseUrl, sessionId: "codec-worker",
+		});
+		expect(await worker.run()).toHaveProperty("compaction");
+		expect(worker.requests).toHaveLength(1);
+		const input = worker.requests[0].input;
+		expect(input.slice(0, opaque.length)).toEqual(opaque);
+		expect(input.slice(opaque.length)).toEqual(await serializeNativeCompactionTailWithLimits({ model, messages: safe.messages, summary: latest.entry.summary }));
+		expect(input.filter((item) => item.type === "compaction")).toHaveLength(1);
+		expect(input.find((item) => item.type === "message")).toMatchObject({ id: "msg_pi_2" });
+		expect(input.find((item) => item.type === "custom_tool_call")).toMatchObject({ input: "return 1" });
+		expect(JSON.stringify(input)).not.toContain("SEALED_RAW_HISTORY");
+		expect(worker.requests[0].tools).toEqual(cachedTools);
+		expect(worker.fallback).toBe(0);
+		expect(manager.getBranch()).toEqual(before);
+	});
+
+	for (const nonAdditive of [false, true]) test(`cached ${nonAdditive ? "current" : "initial"} declarations stay authoritative alongside positioned input`, async () => {
+		const initial = { name: "initial", description: "initial", parameters: { type: "object", properties: {} } };
+		const later = { ...initial, name: "later", description: "later" };
+		const messages: AgentMessage[] = [
+			{ role: "system", content: "initial prompt", toolsAdded: [initial], timestamp: 1 } as AgentMessage,
+			{ role: "user", content: "question", timestamp: 2 },
+			{ role: "system", content: "later prompt", toolsAdded: [later], timestamp: 3 } as AgentMessage,
+		];
+		if (nonAdditive) messages.push({ role: "system", content: "final prompt", toolsRemoved: [{ name: "initial" }], timestamp: 4 } as AgentMessage);
+		const topLevel = resolveTranscriptTools(messages, true);
+		expect(topLevel.anchorsAdditions).toBe(!nonAdditive);
+		expect(topLevel.requestTools).toEqual(nonAdditive ? [later] : [initial]);
+		const tools = convertResponsesTools(topLevel.requestTools, { strict: null, supportsStrictMode: true, supportsOpenAIGrammarTools: true });
+		const worker = harness("legacy", messages, [], model);
+		worker.cache.rememberRequestContext({ model: model.id, input: [], tools }, {
+			provider: model.provider, api: model.api, model: model.id, baseUrl: model.baseUrl, sessionId: "codec-worker",
+		});
+		expect(await worker.run()).toHaveProperty("compaction");
+		expect(worker.requests).toHaveLength(1);
+		expect(worker.requests[0].tools).toEqual(tools);
+		expect(worker.requests[0].input).toEqual(serializeMessagesToResponsesInput(model, messages));
+		expect(worker.requests[0].input.filter((item) => item.type === "additional_tools")).toHaveLength(nonAdditive ? 0 : 1);
+	});
+
+	for (const kind of ["grammar-declaration", "grammar-input", "strict-schema"] as const) test(`${kind}: public hook cancels before dispatch and preserves history`, async () => {
+		const tool = { name: "bad", description: "offline", parameters: { type: "object", properties: { source: { type: "string" } }, required: ["source"] },
+			constrainedSampling: { type: "grammar", variants: kind === "grammar-declaration" ? {} : { openai_lark: "start: /.+/" } } };
+		if (kind === "strict-schema") {
+			Object.assign(tool, { parameters: { type: "object", additionalProperties: true }, constrainedSampling: { type: "json_schema", strict: "require" } });
+		}
+		const messages: AgentMessage[] = [{ role: "system", content: "initial", toolsAdded: [tool], timestamp: 1 } as AgentMessage];
+		if (kind === "grammar-input") messages.push({ ...fauxAssistantMessage(fauxToolCall("bad", { source: 123 }, { id: "call_bad|ctc_bad" }), { stopReason: "toolUse", timestamp: 2 }),
+			provider: model.provider, api: model.api, model: model.id });
+		const before = structuredClone(messages);
+		const worker = harness("legacy", messages, [], model);
+		expect(await worker.run()).toEqual({ cancel: true });
+		expect(worker.requests).toHaveLength(0);
+		expect(worker.fallback).toBe(0);
+		expect(messages).toEqual(before);
+	});
+});
+
+describe("full safe context recursive serialization", () => {
+	const model: Model<"openai-codex-responses"> = { ...liveTailModel, api: "openai-codex-responses",
+		compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true, supportsToolSearch: true, supportsOpenAIGrammarTools: true } };
+	const tool = { name: "script", description: "offline",
+		parameters: { type: "object", properties: { source: { type: "string" } }, required: ["source"] },
+		constrainedSampling: { type: "grammar", variants: { openai_lark: "start: /.+/" } } };
+	function safeContext(): AgentMessage[] {
+		return [
+			{ role: "system", content: "initial", toolsAdded: [tool], timestamp: 1 } as AgentMessage,
+			{ role: "compactionSummary", summary: "unique-checkpoint", tokensBefore: 10, timestamp: 2 },
+			{ role: "system", content: "", timestamp: 3 } as AgentMessage,
+			{ ...fauxAssistantMessage([{ type: "text", text: "unsigned one" }, { type: "text", text: "unsigned two" },
+				fauxToolCall("script", { source: "return 1" }, { id: "call_script|ctc_script" })], { stopReason: "toolUse", timestamp: 4 }),
+				provider: model.provider, api: model.api, model: model.id },
+			{ role: "toolResult", toolCallId: "call_script|ctc_script", toolName: "script", content: [{ type: "text", text: "1" }], isError: false, timestamp: 5 },
+		];
+	}
+
+	test("tail keeps full-context unsigned indexes and historical grammar; never estimates from opaque length", async () => {
+		const messages = safeContext();
+		const before = structuredClone(messages);
+		const tail = await serializeNativeCompactionTailWithLimits({ model, messages, summary: "unique-checkpoint" });
+		expect(tail).toEqual(serializeMessagesToResponsesInput(model, messages).slice(1));
+		expect(tail).toEqual([
+			{ type: "message", role: "assistant", content: [{ type: "output_text", text: "unsigned one", annotations: [] }], status: "completed", id: "msg_pi_2", phase: undefined },
+			{ type: "message", role: "assistant", content: [{ type: "output_text", text: "unsigned two", annotations: [] }], status: "completed", id: "msg_pi_2_1", phase: undefined },
+			{ type: "custom_tool_call", id: "ctc_script", call_id: "call_script", name: "script", input: "return 1" },
+			{ type: "custom_tool_call_output", call_id: "call_script", output: "1" },
+		]);
+		expect(messages).toEqual(before);
+	});
+
+	test("removal/redeclaration anywhere in full safe context disables tail additions", async () => {
+		for (const change of [{ toolsRemoved: [{ name: "script" }] }, { toolsAdded: [tool] }]) {
+			const messages = safeContext();
+			messages.splice(1, 0, { role: "system", content: "sealed update", ...change, timestamp: 2 } as AgentMessage);
+			messages.splice(3, 0, { role: "system", content: "tail update", toolsAdded: [{ name: "plain", description: "plain", parameters: { type: "object", properties: {} } }], timestamp: 3 } as AgentMessage);
+			const tail = await serializeNativeCompactionTailWithLimits({ model, messages, summary: "unique-checkpoint" });
+			expect(tail?.[0]).toEqual({ role: "developer", content: "tail update" });
+			expect(tail?.some((item) => item.type === "additional_tools")).toBe(false);
+			expect(tail?.find((item) => item.type === "custom_tool_call")).toMatchObject({ input: "return 1" });
+		}
+	});
+
+	test("only selected tail images consume limits; past items are not replayed or resized", async () => {
+		const messages = safeContext();
+		const image = { type: "image" as const, data: "AQ==", mimeType: "image/png" };
+		messages.splice(1, 0, { role: "user", content: [image, image], timestamp: 1 });
+		messages.push({ role: "user", content: [image], timestamp: 6 });
+		const limited = { ...model, input: ["text", "image"] as Array<"text" | "image">,
+			inputLimits: { images: { maxPerMessage: 1, maxPerRequest: 1 } } };
+		const tail = await serializeNativeCompactionTailWithLimits({ model: limited, messages, summary: "unique-checkpoint" });
+		expect(tail?.at(-1)).toEqual({ role: "user", content: [{ type: "input_image", detail: "auto", image_url: "data:image/png;base64,AQ==" }] });
+		expect(tail?.filter((item) => item.role === "user")).toHaveLength(1);
+		messages.push({ role: "user", content: [image], timestamp: 7 });
+		await expect(serializeNativeCompactionTailWithLimits({ model: limited, messages, summary: "unique-checkpoint" })).rejects.toThrow("per request");
+	});
+
+	test("missing, duplicate canonical or ambiguous wire summary anchors refuse", async () => {
+		const messages = safeContext();
+		await expect(serializeNativeCompactionTailWithLimits({ model, messages, summary: "missing" })).resolves.toBeUndefined();
+		await expect(serializeNativeCompactionTailWithLimits({ model, messages: [...messages, messages[1]], summary: "unique-checkpoint" })).resolves.toBeUndefined();
+		await expect(serializeNativeCompactionTailWithLimits({ model, messages: [...messages,
+			{ role: "user", content: "<summary>unique-checkpoint</summary>", timestamp: 10 }], summary: "unique-checkpoint" })).resolves.toBeUndefined();
+	});
+});
 
 describe("Pi 0.87 canonical context edits", () => {
 	test("live tail applies omission and replacement without rewriting history", () => {

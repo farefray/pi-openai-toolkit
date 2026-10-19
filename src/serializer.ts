@@ -1,7 +1,6 @@
-import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { compact, convertToLlm } from "@earendil-works/pi-coding-agent";
-import { getDeclaredTools } from "@earendil-works/pi-ai";
+import { getDeclaredTools, getSystemMessageText, renderSystemMessageUpdate, normalizeContext, resolveTranscript, resolveTranscriptTools } from "@earendil-works/pi-ai";
 import type {
 	Api,
 	AssistantMessage,
@@ -11,6 +10,7 @@ import type {
 	TextContent,
 	ThinkingContent,
 	ToolCall,
+	Tool,
 	ToolResultMessage,
 	UserMessage,
 } from "@earendil-works/pi-ai";
@@ -31,8 +31,9 @@ type CompactionPreparation = Parameters<typeof compact>[0];
  * - we only target same-model OpenAI Responses-compatible requests
  * - we only need Pi's current supported message semantics (assistant phase,
  *   reasoning signatures, tool call/result pairing, image blocks)
- * - Pi's shared Responses converter is not publicly exported, so importing it
- *   would require a brittle install-path-specific wrapper
+ * - Pi 1.3 exports the shared converter through an API subpath, but the host's
+ *   jiti root alias currently redirects that subpath to compat.js. Use working
+ *   public root transcript/text helpers, not a loader or install-path bypass.
  *
  * The helpers below intentionally mirror Pi's same-model Responses serialization
  * rules closely so later tasks can compare their output against captured
@@ -80,6 +81,7 @@ export type ResponsesFunctionCallItem = {
 	call_id: string;
 	name: string;
 	arguments: string;
+	namespace?: string;
 };
 
 export type ResponsesFunctionCallOutputItem = {
@@ -94,6 +96,7 @@ export type ResponsesCustomToolCallItem = {
 	call_id: string;
 	name: string;
 	input: string;
+	namespace?: string;
 };
 
 export type ResponsesCustomToolCallOutputItem = {
@@ -169,10 +172,18 @@ function instructionRole<TApi extends Api>(model: Model<TApi>): "developer" | "s
 	return model.reasoning && compat?.supportsDeveloperRole !== false ? "developer" : "system";
 }
 
-/** A grammar refusal must cancel compaction, not fall through a swallowed hook error. */
-export class GrammarToolSerializationError extends Error {
+/** Declaration refusals must cancel compaction, not delegate through a swallowed hook error. */
+export class ToolDeclarationSerializationError extends Error {
+	constructor() {
+		super("Invalid OpenAI tool declaration or unsupported tool transport.");
+		this.name = "ToolDeclarationSerializationError";
+	}
+}
+
+export class GrammarToolSerializationError extends ToolDeclarationSerializationError {
 	constructor(kind: "declaration" | "input") {
-		super(`Invalid OpenAI grammar tool ${kind}.`);
+		super();
+		this.message = `Invalid OpenAI grammar tool ${kind}.`;
 		this.name = "GrammarToolSerializationError";
 	}
 }
@@ -221,6 +232,113 @@ function getLlmGrammarToolInputProperties<TApi extends Api>(
 
 function supportsGrammarTools<TApi extends Api>(model: Model<TApi>): boolean {
 	return (model.compat as { supportsOpenAIGrammarTools?: boolean } | undefined)?.supportsOpenAIGrammarTools === true;
+}
+
+/**
+ * Narrow pure adaptation of pi-ai 1.3 api/constrained-sampling.js and
+ * convertResponsesTools (https://github.com/earendil-works/pi), MIT.
+ * Copyright (c) 2025 Mario Zechner. Permission is hereby granted, free of charge,
+ * to any person obtaining a copy of this software and associated documentation
+ * files (the "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish, distribute,
+ * sublicense, and/or sell copies of the Software, and to permit persons to whom
+ * the Software is furnished to do so, subject to the following conditions:
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS",
+ * WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+ * FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ * THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * Only declaration conversion/strict schema rules are adapted, not SDK streaming.
+ */
+function serializeToolDeclarations<TApi extends Api>(model: Model<TApi>, tools: Tool[]): Record<string, unknown>[] {
+	const codex = model.api === "openai-codex-responses";
+	const supportsStrict = (model.compat as { supportsStrictMode?: boolean } | undefined)?.supportsStrictMode ?? codex;
+	return tools.map((tool) => {
+		const config = tool.constrainedSampling;
+		if (config && config.type === "grammar" && supportsGrammarTools(model)) {
+			// Use the same validation as historical call serialization.
+			getLlmGrammarToolInputProperties(model, [{ role: "system", content: "", toolsAdded: [tool], timestamp: 0 }]);
+			const lark = config.variants.openai_lark;
+			return { type: "custom", name: tool.name, description: tool.description,
+				format: { type: "grammar", syntax: typeof lark === "string" && lark.trim() ? "lark" : "regex",
+					definition: typeof lark === "string" && lark.trim() ? lark : config.variants.openai_regex } };
+		}
+		let strict: boolean | null = codex ? null : false;
+		let parameters = tool.parameters;
+		if (config && config.type === "json_schema") {
+			if (supportsStrict) {
+				try {
+					parameters = makeStrictToolSchema(tool.parameters) as Tool["parameters"];
+					strict = true;
+				} catch (error) {
+					if (!(error instanceof ToolDeclarationSerializationError)) throw error;
+					if (config.strict === "require") throw error;
+				}
+			} else if (config.strict === "require") throw new ToolDeclarationSerializationError();
+		}
+		return { type: "function", name: tool.name, description: tool.description, parameters,
+			...(supportsStrict ? { strict } : {}) };
+	});
+}
+
+function schemaRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function schemaAllowsNull(schema: unknown): boolean {
+	if (!schemaRecord(schema)) return false;
+	return schema.type === "null" || (Array.isArray(schema.type) && schema.type.includes("null")) ||
+		schema.const === null || (Array.isArray(schema.enum) && schema.enum.includes(null)) ||
+		(Array.isArray(schema.anyOf) && schema.anyOf.some(schemaAllowsNull));
+}
+
+function makeStrictToolSchema(schema: unknown): Record<string, unknown> {
+	const cloned: unknown = structuredClone(schema);
+	makeSchemaNodeStrict(cloned);
+	if (!schemaRecord(cloned) || cloned.type !== "object") throw new ToolDeclarationSerializationError();
+	return cloned;
+}
+
+function makeSchemaNodeStrict(schema: unknown): asserts schema is Record<string, unknown> {
+	if (!schemaRecord(schema)) throw new ToolDeclarationSerializationError();
+	for (const key of ["$ref", "$defs", "definitions", "allOf", "oneOf", "patternProperties",
+		"dependentSchemas", "dependencies", "unevaluatedProperties", "propertyNames", "contains",
+		"prefixItems", "not", "if", "then", "else"]) {
+		if (schema[key] !== undefined) throw new ToolDeclarationSerializationError();
+	}
+	if (schema.anyOf !== undefined) {
+		if (!Array.isArray(schema.anyOf) || schema.anyOf.length === 0) throw new ToolDeclarationSerializationError();
+		for (const variant of schema.anyOf) {
+			if (schemaRecord(variant)) {
+				const types = Array.isArray(variant.type) ? variant.type : [variant.type];
+				if (types.includes("object") || types.includes("array") || variant.properties !== undefined || variant.items !== undefined) {
+					throw new ToolDeclarationSerializationError();
+				}
+			}
+			makeSchemaNodeStrict(variant);
+		}
+	}
+	if (schema.items !== undefined) makeSchemaNodeStrict(schema.items);
+	if (schema.properties !== undefined && schema.type !== "object") throw new ToolDeclarationSerializationError();
+	if (schema.type !== "object") return;
+	if (schema.additionalProperties !== undefined && schema.additionalProperties !== false) throw new ToolDeclarationSerializationError();
+	if (schema.properties !== undefined && !schemaRecord(schema.properties)) throw new ToolDeclarationSerializationError();
+	if (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.some((key) => typeof key !== "string"))) {
+		throw new ToolDeclarationSerializationError();
+	}
+	const properties = (schema.properties ?? {}) as Record<string, unknown>;
+	const names = Object.keys(properties);
+	const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+	if ([...required].some((name) => !names.includes(name))) throw new ToolDeclarationSerializationError();
+	for (const [name, property] of Object.entries(properties)) {
+		makeSchemaNodeStrict(property);
+		if (!required.has(name) && !schemaAllowsNull(property)) properties[name] = { anyOf: [property, { type: "null" }] };
+	}
+	schema.required = names;
+	schema.additionalProperties = false;
 }
 
 export function collectCompactionWindowMessages(preparation: CompactionPreparation): AgentMessage[] {
@@ -312,7 +430,23 @@ export function serializeLlmMessagesToResponsesInput<TApi extends Api>(
 	const grammarToolInputProperties = supportsGrammarTools(model)
 		? options.grammarToolInputProperties ?? getLlmGrammarToolInputProperties(model, messages)
 		: new Map<string, string>();
-	const transformedMessages = transformMessagesForResponses(messages);
+	// Preserve the historical local API's mid-conversation updates unless the
+	// model explicitly requires collapsing them. Tail callers keep their first
+	// system message as an update rather than inventing an initial prompt.
+	const normalized = normalizeContext({ messages });
+	const resolved = options.firstSystemMessageIsUpdate ? normalized : resolveTranscript(
+		normalized, (model.compat as { supportsMidConvoSystemMessages?: boolean } | undefined)?.supportsMidConvoSystemMessages ?? true,
+	);
+	const compat = model.compat as {
+		supportsAdditionalTools?: boolean; supportsToolSearch?: boolean;
+	} | undefined;
+	// Decide against the FULL transcript, before transformation or tail selection.
+	const transcriptTools = resolveTranscriptTools(messages,
+		compat?.supportsAdditionalTools === true || compat?.supportsToolSearch === true);
+	// Validate even top-level declarations before dispatch; cached request extras
+	// remain authoritative for the actual top-level tools field.
+	serializeToolDeclarations(model, transcriptTools.requestTools);
+	const transformedMessages = transformMessagesForResponses(resolved.messages);
 	const input: ResponsesInputItem[] = [];
 
 	if (options.includeInstructionsInInput && options.instructions) {
@@ -341,7 +475,7 @@ export function serializeLlmMessagesToResponsesInput<TApi extends Api>(
 		}
 
 		if (message.role === "assistant") {
-			const items = serializeAssistantMessage(message, messageIndex, grammarToolInputProperties);
+			const items = serializeAssistantMessage(message, messageIndex, grammarToolInputProperties, model);
 			if (items.length > 0) {
 				input.push(...items);
 			}
@@ -357,7 +491,15 @@ export function serializeLlmMessagesToResponsesInput<TApi extends Api>(
 
 		// In Pi 0.85.1 this branch narrows to `never`; in Pi 0.86 it is a SystemMessage.
 		// Handle it explicitly instead of letting a new message variant become tool output.
-		const systemItem = serializeSystemMessage(message, model, isLeadingSystemMessage);
+		if (!isLeadingSystemMessage && transcriptTools.anchorsAdditions && message.toolsAdded?.length) {
+			// Search-only transport needs SDK client search IDs/layout. Refuse it
+			// explicitly rather than silently losing positioned declarations.
+			if (!compat?.supportsAdditionalTools) throw new ToolDeclarationSerializationError();
+			input.push({ type: "additional_tools", role: "developer",
+				tools: serializeToolDeclarations(model, message.toolsAdded) });
+		}
+		const systemItem = isLeadingSystemMessage && model.api === "openai-codex-responses"
+			? undefined : serializeSystemMessage(message, model, isLeadingSystemMessage);
 		if (systemItem) {
 			input.push(systemItem);
 		}
@@ -596,14 +738,17 @@ function transformMessagesForResponses(messages: Message[]): Message[] {
 	const transformed: Message[] = [];
 	let pendingToolCalls: ToolCall[] = [];
 	let existingToolResultIds = new Set<string>();
+	const heldSystemMessages: Message[] = [];
+	const closePending = () => {
+		transformed.push(...createSyntheticToolResults(pendingToolCalls, existingToolResultIds), ...heldSystemMessages);
+		pendingToolCalls = [];
+		existingToolResultIds = new Set<string>();
+		heldSystemMessages.length = 0;
+	};
 
 	for (const message of messages) {
 		if (message.role === "assistant") {
-			if (pendingToolCalls.length > 0) {
-				transformed.push(...createSyntheticToolResults(pendingToolCalls, existingToolResultIds));
-				pendingToolCalls = [];
-				existingToolResultIds = new Set<string>();
-			}
+			closePending();
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				continue;
@@ -636,16 +781,15 @@ function transformMessagesForResponses(messages: Message[]): Message[] {
 			continue;
 		}
 
-		if (pendingToolCalls.length > 0) {
-			transformed.push(...createSyntheticToolResults(pendingToolCalls, existingToolResultIds));
-			pendingToolCalls = [];
-			existingToolResultIds = new Set<string>();
+		if (message.role === "system" && pendingToolCalls.length > 0) {
+			heldSystemMessages.push(message);
+			continue;
 		}
-
+		closePending();
 		transformed.push(message);
 	}
 
-	transformed.push(...createSyntheticToolResults(pendingToolCalls, existingToolResultIds));
+	closePending();
 	return transformed;
 }
 
@@ -713,8 +857,11 @@ function serializeAssistantMessage(
 	message: AssistantMessage,
 	messageIndex: number,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
+	model: Model<Api>,
 ): ResponsesInputItem[] {
 	const items: ResponsesInputItem[] = [];
+	const sameModel = message.provider === model.provider && message.api === model.api && message.model === model.id;
+	let textBlockIndex = 0;
 
 	for (const block of message.content) {
 		if (block.type === "thinking") {
@@ -732,7 +879,7 @@ function serializeAssistantMessage(
 				role: "assistant",
 				content: [{ type: "output_text", text: sanitizeSurrogates(block.text), annotations: [] }],
 				status: "completed",
-				id: normalizeAssistantMessageId(signature?.id, messageIndex),
+				id: normalizeAssistantMessageId(signature?.id, messageIndex, textBlockIndex++),
 				phase: signature?.phase,
 			});
 			continue;
@@ -751,6 +898,7 @@ function serializeAssistantMessage(
 				call_id: callId,
 				name: block.name,
 				input: sanitizeSurrogates(rawInput),
+				...(sameModel && block.namespace !== undefined ? { namespace: block.namespace } : {}),
 			});
 			continue;
 		}
@@ -760,6 +908,7 @@ function serializeAssistantMessage(
 			call_id: callId,
 			name: block.name,
 			arguments: JSON.stringify(block.arguments),
+			...(sameModel && block.namespace !== undefined ? { namespace: block.namespace } : {}),
 		});
 	}
 
@@ -840,45 +989,6 @@ function serializeSystemMessage<TApi extends Api>(
 	};
 }
 
-/** Mirrors Pi's public getSystemMessageText() without importing a 0.86-only helper. */
-function getSystemMessageText(message: ResponsesSystemMessage): string {
-	const parts = [contentText(message.content)];
-	for (const text of Object.values(message.sections ?? {})) {
-		if (text !== null) {
-			parts.push(text);
-		}
-	}
-	return parts.filter((part) => part.length > 0).join("\n\n");
-}
-
-/** Mirrors Pi's public renderSystemMessageUpdate() for later transcript updates. */
-function renderSystemMessageUpdate(message: ResponsesSystemMessage): string {
-	const parts: string[] = [];
-	const text = contentText(message.content);
-	if (text.length > 0) {
-		parts.push(text);
-	}
-	for (const [name, value] of Object.entries(message.sections ?? {})) {
-		parts.push(
-			value === null
-				? `Removed system prompt section "${name}".`
-				: `Updated system prompt section "${name}":\n\n${value}`,
-		);
-	}
-	return parts.join("\n\n");
-}
-
-function contentText(content: ResponsesSystemMessage["content"]): string {
-	if (typeof content === "string") {
-		return content;
-	}
-
-	return content
-		.filter((item): item is TextContent => item.type === "text")
-		.map((item) => item.text)
-		.join("\n");
-}
-
 function parseReasoningItem(block: ThinkingContent): ResponsesReasoningItem | undefined {
 	if (!block.thinkingSignature) {
 		return undefined;
@@ -927,16 +1037,26 @@ function parseTextSignature(signature: string | undefined): ParsedTextSignature 
 	}
 }
 
-function normalizeAssistantMessageId(id: string | undefined, messageIndex: number): string {
+function normalizeAssistantMessageId(id: string | undefined, messageIndex: number, textBlockIndex: number): string {
 	if (!id) {
-		return `msg_${messageIndex}`;
+		return textBlockIndex === 0 ? `msg_pi_${messageIndex}` : `msg_pi_${messageIndex}_${textBlockIndex}`;
 	}
+	if (id.length <= 64) return id;
+	return `msg_${shortHash(id)}`;
+}
 
-	if (id.length <= 64) {
-		return id;
+/** Pi utils/hash.js (MIT, Mario Zechner): retain signed long-ID semantics. */
+function shortHash(text: string): string {
+	let h1 = 0xdeadbeef;
+	let h2 = 0x41c6ce57;
+	for (let index = 0; index < text.length; index++) {
+		const ch = text.charCodeAt(index);
+		h1 = Math.imul(h1 ^ ch, 2654435761);
+		h2 = Math.imul(h2 ^ ch, 1597334677);
 	}
-
-	return `msg_${createHash("sha1").update(id).digest("hex").slice(0, 12)}`;
+	h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+	h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+	return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
 }
 
 function isToolCallBlock(block: AssistantMessage["content"][number]): block is ToolCall {

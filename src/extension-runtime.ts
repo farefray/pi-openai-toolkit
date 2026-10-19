@@ -48,7 +48,7 @@ import {
 	rewriteResponsesPayloadWithNativeReplay,
 	hasInvalidatedCompactionContext,
 	removeNativeCompactionRetainedMessages,
-	serializeLiveTailToResponsesInputWithLimits,
+	serializeNativeCompactionTailWithLimits,
 } from "./payload-rewrite";
 import { createRequestContextCache, type RequestContextCache } from "./request-context-cache-core";
 import { resolveWebSearchRoute } from "./web-search/types";
@@ -62,9 +62,7 @@ import {
 } from "./runtime-core";
 import {
 	serializeMessagesToCompactRequestWithLimits,
-	serializeMessagesToResponsesInputWithLimits,
-	getGrammarToolInputProperties,
-	GrammarToolSerializationError,
+	ToolDeclarationSerializationError,
 	type NativeCompactionRequestBody,
 	type ResponsesInputItem,
 } from "./serializer";
@@ -305,20 +303,6 @@ function buildCompactionInstructions(systemPrompt: string, customInstructions?: 
 	return `${systemPrompt}\n\nAdditional user guidance for this manual /compact request:\n${guidance}`;
 }
 
-function findLatestProjectedCompactionSummaryIndex(
-	messages: readonly AgentMessage[],
-	summary: string,
-): number {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index];
-		if (message?.role === "compactionSummary" && message.summary === summary) {
-			return index;
-		}
-	}
-
-	return -1;
-}
-
 function readSessionContextMessages(ctx: ExtensionContext): AgentMessage[] | undefined {
 	try {
 		const projection = ctx.sessionManager.buildSessionProjection();
@@ -404,48 +388,33 @@ async function runResponsesNativeCompact(
 		}
 		requestSource = "latest-native-replay";
 
+		let safeMessages: AgentMessage[];
 		if (config.remoteV2ContextSource === "pi-context-hook") {
 			const projection = await projectSessionContextForCompaction(ctx, projectCompactionContext);
 			if (!projection.ok) {
 				return { outcome: "unprojected-input", reason: projection.reason };
 			}
-			const summaryIndex = findLatestProjectedCompactionSummaryIndex(
-				projection.messages,
-				latestNativeCompaction.entry.summary,
-			);
-			if (summaryIndex < 0) {
-				return {
-					outcome: "unprojected-input",
-					reason: COMPACTION_PROJECTED_CONTEXT_UNAVAILABLE,
-				};
-			}
-			const input: ResponsesInputItem[] = [
-				...(cloneOpaqueWindow(details.compactedWindow) as ResponsesInputItem[]),
-				...(await serializeMessagesToResponsesInputWithLimits(
-					compactor.currentModel,
-					[...projection.messages.slice(summaryIndex + 1)],
-					{ firstSystemMessageIsUpdate: true,
-						grammarToolInputProperties: getGrammarToolInputProperties(compactor.currentModel, [...projection.messages]) },
-				)),
-			];
-			request = {
-				model: compactor.requestModel ?? compactor.model,
-				input,
-				instructions,
-			};
+			// The ordered context hooks already remove verified retained copies.
+			safeMessages = [...projection.messages];
 		} else {
-			const liveTailEntries = branchEntries.slice(latestNativeCompaction.index + 1);
-			const input: ResponsesInputItem[] = [
-				...(cloneOpaqueWindow(details.compactedWindow) as ResponsesInputItem[]),
-				...(await serializeLiveTailToResponsesInputWithLimits({ model: compactor.currentModel, entries: liveTailEntries,
-					grammarToolInputProperties: getGrammarToolInputProperties(compactor.currentModel, readSessionContextMessages(ctx) ?? []) })),
-			];
-			request = {
-				model: compactor.requestModel ?? compactor.model,
-				input,
-				instructions,
-			};
+			const messages = readSessionContextMessages(ctx);
+			if (!messages) return { outcome: "unprojected-input", reason: COMPACTION_SESSION_CONTEXT_UNAVAILABLE };
+			const filtered = removeNativeCompactionRetainedMessages({
+				messages, branchEntries, compactionEntry: latestNativeCompaction.entry,
+				expectedInputProvenance: inputProvenance,
+			});
+			if (!filtered.ok) return { outcome: "unprojected-input", reason: COMPACTION_PROJECTED_CONTEXT_UNAVAILABLE };
+			safeMessages = filtered.messages;
 		}
+		const tail = await serializeNativeCompactionTailWithLimits({
+			model: compactor.currentModel, messages: safeMessages, summary: latestNativeCompaction.entry.summary,
+		});
+		if (!tail) return { outcome: "unprojected-input", reason: COMPACTION_PROJECTED_CONTEXT_UNAVAILABLE };
+		request = {
+			model: compactor.requestModel ?? compactor.model,
+			input: [...(cloneOpaqueWindow(details.compactedWindow) as ResponsesInputItem[]), ...tail],
+			instructions,
+		};
 	} else if (
 		latestNativeCompaction.reason === "no-compaction" ||
 		(latestNativeCompaction.reason === "latest-compaction-not-native" &&
@@ -1644,8 +1613,8 @@ function registerCompactionExtension(
 		try {
 			return await handleSessionBeforeCompact(event, ctx, dependencies, remoteContextActive, getContextToolRegistrationState);
 		} catch (error) {
-			// Preserve unrelated legacy error behavior; grammar refusal must never delegate.
-			if (!activation.projectPolicy && !(error instanceof GrammarToolSerializationError)) throw error;
+			// Preserve unrelated legacy errors; declaration/input refusals never delegate.
+			if (!activation.projectPolicy && !(error instanceof ToolDeclarationSerializationError)) throw error;
 			// The SDK swallows hook errors, so throwing would delegate to its text compactor.
 			try { notifyWarning(ctx, "Remote compaction cancelled: request/context preparation failed. History was left unchanged."); }
 			catch { /* A disposed context must still cancel instead of delegating. */ }

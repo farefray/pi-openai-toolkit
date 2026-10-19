@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { fauxAssistantMessage, fauxToolCall, getDeclaredTools, type Message, type Model, type Tool } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, getDeclaredTools, normalizeContext, resolveTranscriptTools, type Api, type Message, type Model, type Tool } from "@earendil-works/pi-ai";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
-// SDK internals are a parity oracle only; production uses public getDeclaredTools.
+// SDK API subpaths are test-only parity oracles. Production uses root helpers.
 import { createGrammarToolInputProperties } from "@earendil-works/pi-ai/api/constrained-sampling";
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import {
 	GrammarToolSerializationError,
+	ToolDeclarationSerializationError,
 	getGrammarToolInputProperties,
 	createResponsesInputParitySignature,
 	serializeLlmMessagesToResponsesInput,
@@ -195,10 +196,200 @@ function toolItems(input: readonly unknown[]): unknown[] {
 }
 function sdkToolItems(messages: Message[], activeModel = grammarModel): unknown[] {
 	const normalized = convertToLlm(messages);
-	return toolItems(convertResponsesMessages(activeModel, { messages: normalized }, new Set([model.provider]), {
+	return toolItems(convertResponsesMessages(activeModel, normalizeContext({ messages: normalized }), new Set([model.provider]), {
 		grammarToolInputProperties: createGrammarToolInputProperties(getDeclaredTools(normalized), activeModel.compat?.supportsOpenAIGrammarTools === true),
 	}));
 }
+
+const codexModel: Model<"openai-codex-responses"> = {
+	...model, api: "openai-codex-responses",
+	compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true,
+		supportsToolSearch: true, supportsStrictMode: true, supportsOpenAIGrammarTools: true },
+};
+
+/** Provider buildParams options, not the shared converter's different defaults. */
+function sdkEnvelope(messages: Message[], activeModel: Model<Api> = codexModel): unknown[] {
+	const normalized = convertToLlm(messages);
+	const codex = activeModel.api === "openai-codex-responses";
+	const compat = activeModel.compat as {
+		supportsAdditionalTools?: boolean; supportsToolSearch?: boolean;
+		supportsStrictMode?: boolean; supportsOpenAIGrammarTools?: boolean;
+	} | undefined;
+	return convertResponsesMessages(activeModel, normalizeContext({ messages: normalized }), new Set([activeModel.provider]), {
+		includeSystemPrompt: !codex,
+		supportsMidConvoSystemMessages: true,
+		supportsAdditionalTools: compat?.supportsAdditionalTools === true,
+		supportsToolSearch: compat?.supportsToolSearch === true,
+		grammarToolInputProperties: createGrammarToolInputProperties(getDeclaredTools(normalized), compat?.supportsOpenAIGrammarTools === true),
+		toolOptions: { ...(codex ? { strict: null } : {}),
+			supportsStrictMode: compat?.supportsStrictMode ?? codex,
+			supportsOpenAIGrammarTools: compat?.supportsOpenAIGrammarTools === true },
+	});
+}
+
+function plainTool(name: string): Tool {
+	return { name, description: name, parameters: { type: "object", properties: {} } as Tool["parameters"] };
+}
+function sameModelText(blocks: Array<{ type: "text"; text: string; textSignature?: string }>, activeModel: Model<Api> = codexModel): Message {
+	return { ...fauxAssistantMessage(blocks, { timestamp: 10 }), provider: activeModel.provider,
+		api: activeModel.api, model: activeModel.id };
+}
+
+describe("normal request envelope SDK parity", () => {
+	test("Codex excludes only the leading system; ordinary Responses includes it", () => {
+		const messages = [systemMessage("initial", { rules: "initial rule" }),
+			{ role: "user", content: "question", timestamp: 1 } as Message,
+			systemMessage("later", { rules: "new rule", gone: null }),
+			sameModelText([{ type: "text", text: "unsigned" }])];
+		const before = structuredClone(messages);
+		const actual = serializeLlmMessagesToResponsesInput(codexModel, messages);
+		expect(actual).toEqual(sdkEnvelope(messages));
+		expect(actual[0]).toEqual({ role: "user", content: [{ type: "input_text", text: "question" }] });
+		expect(actual[1]).toEqual({ role: "developer", content: 'later\n\nUpdated system prompt section "rules":\n\nnew rule\n\nRemoved system prompt section "gone".' });
+		expect(actual[2]).toMatchObject({ id: "msg_pi_2" });
+		const ordinary = { ...model, compat: { ...codexModel.compat } };
+		const ordinaryMessages = [...messages.slice(0, -1), sameModelText([{ type: "text", text: "unsigned" }], ordinary)];
+		expect(serializeLlmMessagesToResponsesInput(ordinary, ordinaryMessages)).toEqual(sdkEnvelope(ordinaryMessages, ordinary));
+		expect(serializeLlmMessagesToResponsesInput(ordinary, ordinaryMessages)[0]).toEqual({ role: "developer", content: "initial\n\ninitial rule" });
+		expect(messages).toEqual(before);
+	});
+
+	test("empty updates count; text blocks get unique IDs while signed IDs and phases survive", () => {
+		const messages = [systemMessage("initial"), { role: "user", content: "question", timestamp: 1 } as Message,
+			systemMessage(""), sameModelText([
+				{ type: "text", text: "first" },
+				{ type: "text", text: "signed", textSignature: JSON.stringify({ v: 1, id: "msg_signed", phase: "commentary" }) },
+				{ type: "text", text: "third" },
+				{ type: "text", text: "final", textSignature: JSON.stringify({ v: 1, id: "long".repeat(30), phase: "final_answer" }) },
+			])];
+		const actual = serializeLlmMessagesToResponsesInput(codexModel, messages);
+		expect(actual).toEqual(sdkEnvelope(messages));
+		expect(actual.slice(1, 4).map((item) => item.id)).toEqual(["msg_pi_2", "msg_signed", "msg_pi_2_2"]);
+		expect(actual[2]).toMatchObject({ phase: "commentary" });
+		expect(actual[4]).toMatchObject({ phase: "final_answer" });
+	});
+
+	test("positioned plain/strict/grammar declarations precede their later system text", () => {
+		const strict = { ...plainTool("strict"), parameters: { type: "object", properties: {
+			value: { type: "string" }, optional: { type: "array", items: { type: "number" } },
+			nested: { type: "object", properties: { flag: { type: "boolean" } } },
+		}, required: ["value"] }, constrainedSampling: { type: "json_schema", strict: "require" } } as Tool;
+		const grammar = grammarTool();
+		grammar.constrainedSampling = { type: "grammar", variants: { openai_lark: "start: /.+/", openai_regex: ".*" } };
+		const messages: Message[] = [declaration(plainTool("initial")), { role: "user", content: "question", timestamp: 1 },
+			{ role: "system", content: "positioned text", toolsAdded: [plainTool("plain"), strict, grammar], timestamp: 2 },
+			sameModelText([{ type: "text", text: "unsigned" }])];
+		const before = structuredClone(messages);
+		const actual = serializeLlmMessagesToResponsesInput(codexModel, messages);
+		expect(actual).toEqual(sdkEnvelope(messages));
+		expect(actual[1]).toEqual({ type: "additional_tools", role: "developer", tools: [
+			{ type: "function", name: "plain", description: "plain", parameters: { type: "object", properties: {} }, strict: null },
+			{ type: "function", name: "strict", description: "strict", strict: true, parameters: {
+				type: "object", properties: { value: { type: "string" },
+					optional: { anyOf: [{ type: "array", items: { type: "number" } }, { type: "null" }] },
+					nested: { anyOf: [{ type: "object", properties: { flag: { anyOf: [{ type: "boolean" }, { type: "null" }] } }, required: ["flag"], additionalProperties: false }, { type: "null" }] },
+				}, required: ["value", "optional", "nested"], additionalProperties: false,
+			} },
+			{ type: "custom", name: "script", description: "offline grammar fixture", format: { type: "grammar", syntax: "lark", definition: "start: /.+/" } },
+		] });
+		expect(actual[2]).toEqual({ role: "developer", content: "positioned text" });
+		expect(actual[3]).toMatchObject({ id: "msg_pi_2" });
+		expect(resolveTranscriptTools(messages, true).requestTools).toEqual([plainTool("initial")]);
+		expect(messages).toEqual(before);
+	});
+
+	for (const change of [
+		{ toolsRemoved: [{ name: "later" }] },
+		{ toolsAdded: [plainTool("later")] },
+		{ toolsAdded: [{ ...plainTool("later"), description: "changed" }] },
+	]) test(`any full-history non-additive change disables all additions: ${JSON.stringify(change)}`, () => {
+		const messages: Message[] = [declaration(plainTool("initial")),
+			{ role: "user", content: "question", timestamp: 1 },
+			{ role: "system", content: "addition text", toolsAdded: [plainTool("later")], timestamp: 2 },
+			{ role: "system", content: "change text", ...change, timestamp: 3 }];
+		const actual = serializeLlmMessagesToResponsesInput(codexModel, messages);
+		expect(actual).toEqual(sdkEnvelope(messages));
+		expect(actual).toEqual([{ role: "user", content: [{ type: "input_text", text: "question" }] },
+			{ role: "developer", content: "addition text" }, { role: "developer", content: "change text" }]);
+		const current = resolveTranscriptTools(messages, true);
+		expect(current.anchorsAdditions).toBe(false);
+		expect(current.requestTools).toEqual(change.toolsRemoved ? [plainTool("initial")] : [plainTool("initial"), change.toolsAdded![0]]);
+	});
+
+	test("strict prefer falls back; strict require fails closed without mutating declarations", () => {
+		const unsupported = { ...plainTool("bad"), parameters: { type: "object", additionalProperties: true },
+			constrainedSampling: { type: "json_schema", strict: "prefer" } } as Tool;
+		for (const activeModel of [codexModel, { ...model, compat: { ...codexModel.compat, supportsStrictMode: false } }]) {
+			const messages: Message[] = [systemMessage("initial"), declaration(unsupported)];
+			const before = structuredClone(messages);
+			expect(serializeLlmMessagesToResponsesInput(activeModel, messages)).toEqual(sdkEnvelope(messages, activeModel));
+			unsupported.constrainedSampling = { type: "json_schema", strict: "require" };
+			expect(() => serializeLlmMessagesToResponsesInput(activeModel, messages)).toThrow(ToolDeclarationSerializationError);
+			unsupported.constrainedSampling = { type: "json_schema", strict: "prefer" };
+			expect(messages).toEqual(before);
+		}
+	});
+
+	for (const parameters of [
+		{ type: "object", properties: { nullable: { type: ["string", "null"] }, value: { enum: ["x", null] } } },
+		{ type: "object", properties: { choice: { anyOf: [{ type: "string" }, { type: "number" }] } }, required: ["choice"], additionalProperties: false },
+	]) test(`strict nullable and primitive-union schemas match SDK: ${JSON.stringify(parameters)}`, () => {
+		const tool = { ...plainTool("schema"), parameters, constrainedSampling: { type: "json_schema", strict: "require" } } as Tool;
+		const messages = [systemMessage("initial"), declaration(tool)];
+		const before = structuredClone(messages);
+		expect(serializeLlmMessagesToResponsesInput(codexModel, messages)).toEqual(sdkEnvelope(messages));
+		expect(messages).toEqual(before);
+	});
+
+	for (const parameters of [true, { type: "string" }, { type: "object", required: ["unknown"] },
+		{ type: "object", required: [123] }, { type: "object", properties: [] },
+		{ type: "object", additionalProperties: { type: "string" } },
+		{ type: "object", properties: { value: { $ref: "#/$defs/Value" } } },
+		{ type: "object", properties: { value: { anyOf: [] } } },
+		{ type: "object", properties: { value: { anyOf: [{ type: "object" }] } } },
+		{ type: "object", properties: { value: { type: "array", items: [{ type: "string" }] } } },
+	]) test(`strict invalid schema require refuses and prefer preserves SDK fallback: ${JSON.stringify(parameters)}`, () => {
+		const tool = { ...plainTool("schema"), parameters, constrainedSampling: { type: "json_schema", strict: "require" } } as Tool;
+		const messages = [systemMessage("initial"), declaration(tool)];
+		const before = structuredClone(messages);
+		expect(() => serializeLlmMessagesToResponsesInput(codexModel, messages)).toThrow(ToolDeclarationSerializationError);
+		expect(() => sdkEnvelope(messages)).toThrow();
+		expect(messages).toEqual(before);
+		tool.constrainedSampling = { type: "json_schema", strict: "prefer" };
+		expect(serializeLlmMessagesToResponsesInput(codexModel, messages)).toEqual(sdkEnvelope(messages));
+	});
+
+	test("search-only positioned additions explicitly refuse, additive-disabled cases remain supported", () => {
+		const searchOnly = { ...codexModel, compat: { ...codexModel.compat, supportsAdditionalTools: false } };
+		const messages = [declaration(plainTool("initial")), declaration(plainTool("later"))];
+		expect(() => serializeLlmMessagesToResponsesInput(searchOnly, messages)).toThrow(ToolDeclarationSerializationError);
+		expect(serializeLlmMessagesToResponsesInput(searchOnly, [messages[0]])).toEqual([]);
+		expect(serializeLlmMessagesToResponsesInput(searchOnly, [...messages,
+			{ role: "system", content: "", toolsRemoved: [{ name: "later" }], timestamp: 3 }])).toEqual([]);
+	});
+
+	test("system updates between a call and real results wait for the whole batch, with no duplicate synthetic result", () => {
+		const batch = { ...assistant(), api: codexModel.api } as Message;
+		const messages = [systemMessage("initial"), batch, result(0), systemMessage("update"), result(1)];
+		const actual = serializeLlmMessagesToResponsesInput(codexModel, messages);
+		expect(actual).toEqual(sdkEnvelope(messages));
+		expect(actual.map((item) => item.type ?? item.role)).toEqual(["function_call", "function_call", "function_call_output", "function_call_output", "developer"]);
+		expect(JSON.stringify(actual)).not.toContain("No result provided");
+	});
+
+	test("same-model call/result IDs and namespaces survive both function and grammar serialization", () => {
+		const call = grammarCall();
+		if (call.role !== "assistant" || call.content[0].type !== "toolCall") throw new Error("fixture");
+		call.api = codexModel.api;
+		call.content[0].namespace = "fixture_namespace";
+		const messages = [declaration(grammarTool()), call, grammarResult()];
+		expect(serializeLlmMessagesToResponsesInput(codexModel, messages)).toEqual(sdkEnvelope(messages));
+		expect(serializeLlmMessagesToResponsesInput(codexModel, messages)[0]).toMatchObject({ id: "ctc_script", call_id: "call_script", namespace: "fixture_namespace" });
+		const plain = { ...codexModel, compat: { ...codexModel.compat, supportsOpenAIGrammarTools: false } };
+		call.content[0].id = "call_script|fc_script";
+		expect(serializeLlmMessagesToResponsesInput(plain, messages)).toEqual(sdkEnvelope(messages, plain));
+	});
+});
 
 describe("Responses persisted grammar compatibility", () => {
 	for (const [variant, property] of [["openai_lark", "source"], ["openai_regex", "expression"], ["openai_lark", "code"]]) {
